@@ -2,31 +2,47 @@
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, call, mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
 from backup.core import (
-    MAX_SNAPSHOTS,
+    MAX_DAILY_SNAPSHOTS,
+    _deserialise_value,
     _fetch_entities,
+    _infer_edm_type,
     _prune_snapshots,
+    _serialise_value,
     run_backup,
     run_restore,
 )
-
 
 # ---------------------------------------------------------------------------
 # Constants and fixtures
 # ---------------------------------------------------------------------------
 
-ENTITIES = [
+
+ENTITIES_PLAIN = [
     {"PartitionKey": "a", "RowKey": "1"},
     {"PartitionKey": "b", "RowKey": "2"},
 ]
 
+ENTITIES_TAGGED = [
+    {
+        "PartitionKey": {"__type__": "Edm.String", "value": "a"},
+        "RowKey": {"__type__": "Edm.String", "value": "1"},
+    },
+    {
+        "PartitionKey": {"__type__": "Edm.String", "value": "b"},
+        "RowKey": {"__type__": "Edm.String", "value": "2"},
+    },
+]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def make_blob(name: str) -> MagicMock:
     b = MagicMock()
@@ -38,11 +54,12 @@ def make_blob(name: str) -> MagicMock:
 # _fetch_entities
 # ---------------------------------------------------------------------------
 
-def test_fetch_entities_returns_plain_dicts():
+
+def test_fetch_entities_returns_tagged_dicts():
     table = MagicMock()
-    table.list_entities.return_value = ENTITIES
+    table.list_entities.return_value = ENTITIES_PLAIN
     result = _fetch_entities(table)
-    assert result == ENTITIES # should be plain dicts, not SDK Entity objects 
+    assert result == ENTITIES_TAGGED
 
 
 def test_fetch_entities_empty_table():
@@ -55,6 +72,7 @@ def test_fetch_entities_empty_table():
 # _prune_snapshots
 # ---------------------------------------------------------------------------
 
+
 def _make_blobs(names):
     return [make_blob(n) for n in names]
 
@@ -65,7 +83,7 @@ def test_prune_deletes_oldest_when_over_limit():
     blob_service.get_container_client.return_value = container_client
 
     # 8 snapshots — oldest should be deleted
-    names = [f"ats-backups/2026-01-0{i}T00:00Z.json" for i in range(1, 9)]
+    names = [f"2026-01-0{i}T00:00Z.json" for i in range(1, 9)]
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
@@ -81,7 +99,7 @@ def test_prune_does_not_delete_when_at_limit():
     blob_service = MagicMock()
     blob_service.get_container_client.return_value = container_client
 
-    names = [f"ats-backups/2026-01-0{i}T00:00Z.json" for i in range(1, MAX_SNAPSHOTS + 1)]
+    names = [f"2026-01-0{i}T00:00Z.json" for i in range(1, MAX_DAILY_SNAPSHOTS + 1)]
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
@@ -95,8 +113,8 @@ def test_prune_excludes_status_blob():
     blob_service.get_container_client.return_value = container_client
 
     # status.json + 7 snapshots — nothing should be pruned
-    names = [f"ats-backups/2026-01-0{i}T00:00Z.json" for i in range(1, MAX_SNAPSHOTS + 1)]
-    names.append("ats-backups/status.json")
+    names = [f"2026-01-0{i}T00:00Z.json" for i in range(1, MAX_DAILY_SNAPSHOTS + 1)]
+    names.append("status.json")
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
@@ -107,6 +125,7 @@ def test_prune_excludes_status_blob():
 # ---------------------------------------------------------------------------
 # run_backup
 # ---------------------------------------------------------------------------
+
 
 @patch("backup.core._prune_snapshots")
 @patch("backup.core._blob_client")
@@ -140,16 +159,23 @@ def test_run_backup_uploads_snapshot_and_status(
     snapshot_payload = json.loads(uploaded[0])
     status_payload = json.loads(uploaded[1])
 
-    assert snapshot_payload == [{"PartitionKey": "a", "RowKey": "1"}]
+    assert snapshot_payload == [
+        {
+            "PartitionKey": {"__type__": "Edm.String", "value": "a"},
+            "RowKey": {"__type__": "Edm.String", "value": "1"},
+        }
+    ]
+
     assert status_payload["status"] == "success"
     assert status_payload["entity_count"] == 1
-    assert status_payload["latest_snapshot"] == "ats-backups/2026-06-11T02:00Z.json"
+    assert status_payload["latest_snapshot"] == "2026-06-11T02:00Z.json"
     mock_prune.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
 # run_restore
 # ---------------------------------------------------------------------------
+
 
 @patch("backup.core.TableServiceClient")
 @patch("backup.core._table_client")
@@ -202,7 +228,41 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
 # Environment variable handling
 # ---------------------------------------------------------------------------
 
+
 def test_missing_env_var_raises():
     from backup.core import _get_env
+
     with pytest.raises(EnvironmentError, match="MISSING_VAR"):
         _get_env("MISSING_VAR")
+
+
+# ---------------------------------------------------------------------------
+# Type roundtrip tests
+# ---------------------------------------------------------------------------
+
+
+def test_all_types_roundtrip():
+    """Verify all ATS types survive encode → JSON → decode correctly."""
+    test_cases = {
+        "datetime": datetime(2026, 6, 9, 10, 18, 39, 874273, tzinfo=UTC),
+        "bool": True,
+        "int": 256,
+        "float": 1734.858602,
+        "str": "complete",
+    }
+
+    for name, original in test_cases.items():
+        # Encode
+        tagged = {
+            "__type__": _infer_edm_type(original),
+            "value": _serialise_value(original),
+        }
+
+        # JSON transit
+        loaded = json.loads(json.dumps(tagged))
+
+        # Decode and verify
+        restored = _deserialise_value(loaded["__type__"], loaded["value"])
+
+        assert restored == original, f"{name} failed: {restored} != {original}"
+        assert type(restored) is type(original), f"{name} type mismatch"

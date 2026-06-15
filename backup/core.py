@@ -10,16 +10,16 @@ Environment variables required:
     BACKUP_CONTAINER_NAME       : Blob container for backups (e.g. 'nhp-backups')
 
 Backup layout in blob storage:
-    ats-backups/YYYY-MM-DDTHH:MMZ.json   — snapshot
-    ats-backups/status.json              — latest run status (read by nhp_ats_tui)
+    ats-bak/YYYY-MM-DDTHH:MMZ.json   — snapshot
+    ats-bak/status.json              — latest run status (read by nhp_ats_tui)
 
 Restore (from latest snapshot):
     1. Identify latest snapshot:
          az storage blob list --account-name <account> --container-name <container> \
-             --prefix ats-backups/ --query "[].name" -o tsv | sort | tail -1
+             --prefix ats-bak/ --query "[].name" -o tsv | sort | tail -1
     2. Download:
          az storage blob download --account-name <account> \
-             --container-name <container> --name ats-backups/<filename> --file restore.json
+             --container-name <container> --name ats-bak/<filename> --file restore.json
     3. Re-create table if missing:
          az storage table create --name <table> --account-name <account>
     4. Restore entities:
@@ -40,7 +40,17 @@ load_dotenv()
 
 BACKUP_PREFIX = ""
 STATUS_BLOB = "status.json"
-MAX_SNAPSHOTS = 7
+MAX_DAILY_SNAPSHOTS = 7
+MAX_MONTHLY_SNAPSHOTS = 6
+
+SUPPORTED_EDM_TYPES = {
+    "Edm.DateTime",
+    "Edm.Boolean",
+    "Edm.Int32",
+    "Edm.Int64",
+    "Edm.Double",
+    "Edm.String",
+}
 
 
 def _get_env(name: str) -> str:
@@ -75,8 +85,55 @@ def _blob_client(credential: DefaultAzureCredential) -> BlobServiceClient:
 
 
 def _fetch_entities(table_client: TableClient) -> list[dict]:
-    """Fetch all entities from the table as plain dicts."""
-    return [dict(e) for e in table_client.list_entities()]
+    """Fetch all entities with EDM type tags preserved."""
+    tagged = []
+    for e in table_client.list_entities():
+        entity = {}
+        # Handle both real SDK entities (with .metadata) and plain dicts (tests)
+        metadata = getattr(e, "metadata", {})
+        for key, value in e.items():
+            if key.startswith("__"):
+                continue
+            edm_type = metadata.get("type", {}).get(key) if metadata else None
+            if not edm_type:
+                edm_type = _infer_edm_type(value)
+            entity[key] = {"__type__": edm_type, "value": _serialise_value(value)}
+        tagged.append(entity)
+    return tagged
+
+
+def _infer_edm_type(value):
+    """Guess EDM type from Python value."""
+    type_name = type(value).__name__
+    if type_name == "datetime":
+        return "Edm.DateTime"
+    if isinstance(value, bool):
+        return "Edm.Boolean"
+    if isinstance(value, int):
+        return "Edm.Int64"
+    if isinstance(value, float):
+        return "Edm.Double"
+    return "Edm.String"
+
+
+def _serialise_value(value):
+    if type(value).__name__ == "datetime":
+        return value.isoformat()
+    return value
+
+
+def _deserialise_value(edm_type: str, value):
+    if edm_type not in SUPPORTED_EDM_TYPES:
+        raise ValueError(f"Unsupported EDM type: {edm_type}")
+    if "DateTime" in edm_type:
+        return datetime.fromisoformat(value)
+    if "Boolean" in edm_type:
+        return bool(value)
+    if "Int" in edm_type:
+        return int(value)
+    if "Double" in edm_type:
+        return float(value)
+    return str(value)
 
 
 def _upload_blob(
@@ -88,7 +145,7 @@ def _upload_blob(
 
 
 def _prune_snapshots(blob_service: BlobServiceClient, container: str) -> None:
-    """Delete oldest snapshots, keeping only the last MAX_SNAPSHOTS."""
+    """Delete oldest snapshots, keeping only the last MAX_DAILY_SNAPSHOTS."""
     container_client = blob_service.get_container_client(container)
     blobs = sorted(
         [
@@ -97,9 +154,12 @@ def _prune_snapshots(blob_service: BlobServiceClient, container: str) -> None:
             if b.name != STATUS_BLOB
         ]
     )
-    for old in blobs[:-MAX_SNAPSHOTS]:
-        blob_service.get_blob_client(container=container, blob=old).delete_blob()
-        logging.info("Pruned old snapshot: %s", old)
+
+    blobs = [b for b in blobs if b != STATUS_BLOB]  # Exclude status from count
+    if len(blobs) > MAX_DAILY_SNAPSHOTS:
+        for old in blobs[:-MAX_DAILY_SNAPSHOTS]:
+            blob_service.get_blob_client(container=container, blob=old).delete_blob()
+            logging.info("Pruned old snapshot: %s", old)
 
 
 def run_backup() -> None:
@@ -163,14 +223,21 @@ def run_restore(snapshot_path: str) -> None:
     logging.info("Entities before restore: %d", before_count)
 
     with open(snapshot_path) as f:
-        entities = json.load(f)
+        tagged_entities = json.load(f)
 
-    for entity in entities:
+    for tagged in tagged_entities:
+        # Support both tagged format and legacy plain format
+        entity = {}
+        for k, v in tagged.items():
+            if isinstance(v, dict) and "__type__" in v:
+                entity[k] = _deserialise_value(v["__type__"], v["value"])
+            else:
+                entity[k] = v  # Legacy format: use as-is
         table.upsert_entity(entity)
 
     after_count = sum(1 for _ in table.list_entities())
     logging.info("Entities after restore: %d", after_count)
-    logging.info("Restore complete. %d entities upserted.", len(entities))
+    logging.info("Restore complete. %d entities upserted.", len(tagged_entities))
 
 
 if __name__ == "__main__":
