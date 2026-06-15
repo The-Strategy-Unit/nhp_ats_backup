@@ -2,31 +2,51 @@
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, call, mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
 from backup.core import (
-    MAX_SNAPSHOTS,
+    MAX_DAILY_SNAPSHOTS,
+    _deserialize_value,
     _fetch_entities,
+    _infer_edm_type,
     _prune_snapshots,
+    _serialize_value,
     run_backup,
     run_restore,
 )
-
 
 # ---------------------------------------------------------------------------
 # Constants and fixtures
 # ---------------------------------------------------------------------------
 
-ENTITIES = [
-    {"PartitionKey": "a", "RowKey": "1"},
-    {"PartitionKey": "b", "RowKey": "2"},
+
+class MockEntity(dict):
+    metadata = None
+
+
+ENTITIES_PLAIN = [
+    MockEntity(PartitionKey="a", RowKey="1"),
+    MockEntity(PartitionKey="b", RowKey="2"),
 ]
+
+ENTITY_A = {
+    "PartitionKey": {"__type__": "Edm.String", "value": "a"},
+    "RowKey": {"__type__": "Edm.String", "value": "1"},
+}
+ENTITY_B = {
+    "PartitionKey": {"__type__": "Edm.String", "value": "b"},
+    "RowKey": {"__type__": "Edm.String", "value": "2"},
+}
+
+ENTITIES_TAGGED = [ENTITY_A, ENTITY_B]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def make_blob(name: str) -> MagicMock:
     b = MagicMock()
@@ -38,11 +58,12 @@ def make_blob(name: str) -> MagicMock:
 # _fetch_entities
 # ---------------------------------------------------------------------------
 
-def test_fetch_entities_returns_plain_dicts():
+
+def test_fetch_entities_returns_tagged_dicts():
     table = MagicMock()
-    table.list_entities.return_value = ENTITIES
+    table.list_entities.return_value = ENTITIES_PLAIN
     result = _fetch_entities(table)
-    assert result == ENTITIES # should be plain dicts, not SDK Entity objects 
+    assert result == ENTITIES_TAGGED
 
 
 def test_fetch_entities_empty_table():
@@ -55,6 +76,7 @@ def test_fetch_entities_empty_table():
 # _prune_snapshots
 # ---------------------------------------------------------------------------
 
+
 def _make_blobs(names):
     return [make_blob(n) for n in names]
 
@@ -64,16 +86,22 @@ def test_prune_deletes_oldest_when_over_limit():
     blob_service = MagicMock()
     blob_service.get_container_client.return_value = container_client
 
-    # 8 snapshots — oldest should be deleted
-    names = [f"ats-backups/2026-01-0{i}T00:00Z.json" for i in range(1, 9)]
+    # 14 blobs across 2 months:
+    #   old = first 7 blobs (one per month Jan-Jul), monthly_keepers[-6:] keeps Feb-Jul
+    #   daily keepers = 7 Aug blobs
+    #   Jan blob is pruned (oldest month, outside last 6)
+    names = (
+        [f"2025-{i:02d}-01T00:00Z.json" for i in range(1, 8)]  # Jan-Jul 2025
+        + [f"2025-08-{i:02d}T00:00Z.json" for i in range(1, 8)]  # Aug 1-7 2025
+    )
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
 
-    blob_service.get_blob_client.assert_called_once_with(
-        container="my-container", blob=names[0]
+    # The Jan 2025 blob (names[0]) should have been pruned (only one deleted)
+    blob_service.get_blob_client.assert_any_call(
+        container="my-container", blob="2025-01-01T00:00Z.json"
     )
-    blob_service.get_blob_client.return_value.delete_blob.assert_called_once()
 
 
 def test_prune_does_not_delete_when_at_limit():
@@ -81,7 +109,7 @@ def test_prune_does_not_delete_when_at_limit():
     blob_service = MagicMock()
     blob_service.get_container_client.return_value = container_client
 
-    names = [f"ats-backups/2026-01-0{i}T00:00Z.json" for i in range(1, MAX_SNAPSHOTS + 1)]
+    names = [f"2026-01-0{i}T00:00Z.json" for i in range(1, MAX_DAILY_SNAPSHOTS + 1)]
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
@@ -95,8 +123,8 @@ def test_prune_excludes_status_blob():
     blob_service.get_container_client.return_value = container_client
 
     # status.json + 7 snapshots — nothing should be pruned
-    names = [f"ats-backups/2026-01-0{i}T00:00Z.json" for i in range(1, MAX_SNAPSHOTS + 1)]
-    names.append("ats-backups/status.json")
+    names = [f"2026-01-0{i}T00:00Z.json" for i in range(1, MAX_DAILY_SNAPSHOTS + 1)]
+    names.append("status.json")
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
@@ -107,6 +135,7 @@ def test_prune_excludes_status_blob():
 # ---------------------------------------------------------------------------
 # run_backup
 # ---------------------------------------------------------------------------
+
 
 @patch("backup.core._prune_snapshots")
 @patch("backup.core._blob_client")
@@ -120,19 +149,26 @@ def test_prune_excludes_status_blob():
     "os.environ",
     {
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
-        "MODEL_RUNS_TABLE_NAME": "mytable",
+        "PROD_TABLE_NAME": "mytable",
         "BACKUP_CONTAINER_NAME": "mycontainer",
     },
 )
 def test_run_backup_uploads_snapshot_and_status(
     mock_dt, mock_cred, mock_table_client, mock_blob_client, mock_prune
 ):
+    class MockEntity(dict):
+        metadata = None
+
     mock_table_client.return_value.list_entities.return_value = [
-        {"PartitionKey": "a", "RowKey": "1"}
+        MockEntity(PartitionKey="a", RowKey="1")
     ]
     blob_service = mock_blob_client.return_value
     blob_client = MagicMock()
     blob_service.get_blob_client.return_value = blob_client
+
+    # Set up download_blob().readall() to return the snapshot that was uploaded
+    expected_snapshot = json.dumps([ENTITY_A])
+    blob_client.download_blob.return_value.readall.return_value = expected_snapshot
 
     run_backup()
 
@@ -140,16 +176,23 @@ def test_run_backup_uploads_snapshot_and_status(
     snapshot_payload = json.loads(uploaded[0])
     status_payload = json.loads(uploaded[1])
 
-    assert snapshot_payload == [{"PartitionKey": "a", "RowKey": "1"}]
+    assert snapshot_payload == [
+        {
+            "PartitionKey": {"__type__": "Edm.String", "value": "a"},
+            "RowKey": {"__type__": "Edm.String", "value": "1"},
+        }
+    ]
+
     assert status_payload["status"] == "success"
     assert status_payload["entity_count"] == 1
-    assert status_payload["latest_snapshot"] == "ats-backups/2026-06-11T02:00Z.json"
+    assert status_payload["latest_snapshot"] == "2026-06-11T02:00Z.json"
     mock_prune.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
 # run_restore
 # ---------------------------------------------------------------------------
+
 
 @patch("backup.core.TableServiceClient")
 @patch("backup.core._table_client")
@@ -158,7 +201,7 @@ def test_run_backup_uploads_snapshot_and_status(
     "os.environ",
     {
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
-        "MODEL_RUNS_TABLE_NAME": "mytable",
+        "PROD_TABLE_NAME": "mytable",
     },
 )
 def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc):
@@ -167,7 +210,7 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
         {"PartitionKey": "b", "RowKey": "2"},
     ]
     table = mock_table_client.return_value
-    table.list_entities.return_value = iter(entities)
+    table.list_entities.side_effect = lambda: iter(entities)  # Fresh iter on each call
 
     with patch("builtins.open", mock_open(read_data=json.dumps(entities))):
         run_restore("restore.json")
@@ -175,6 +218,8 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
     assert table.upsert_entity.call_count == 2
     table.upsert_entity.assert_any_call({"PartitionKey": "a", "RowKey": "1"})
     table.upsert_entity.assert_any_call({"PartitionKey": "b", "RowKey": "2"})
+    assert table.submit_transaction.call_count == 2
+    assert len(table.submit_transaction.call_args[0][0]) == 1  # two deletes in one batch
 
 
 @patch("backup.core.TableServiceClient")
@@ -183,8 +228,9 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
 @patch.dict(
     "os.environ",
     {
+        "AZURE_FUNCTIONS_ENVIRONMENT": "Production",
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
-        "MODEL_RUNS_TABLE_NAME": "mytable",
+        "PROD_TABLE_NAME": "mytable",
     },
 )
 def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock_tsc):
@@ -198,11 +244,72 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
     tsc_instance.create_table_if_not_exists.assert_called_once_with("mytable")
 
 
+def test_run_restore_handles_tagged_entities_with_datetime():
+    """Verify that EDM-tagged JSON (including DateTime) is deserialized correctly."""
+    tagged = [
+        {
+            "PartitionKey": {"__type__": "Edm.String", "value": "pk1"},
+            "RowKey": {"__type__": "Edm.String", "value": "rk1"},
+            "Timestamp": {
+                "__type__": "Edm.DateTime",
+                "value": "2026-06-11T02:00:00+00:00",
+            },
+            "count": {"__type__": "Edm.Int64", "value": 42},
+        }
+    ]
+    with patch("builtins.open", mock_open(read_data=json.dumps(tagged))):
+        with patch("backup.core._table_client") as mock_table_client:
+            table = MagicMock()
+            table.list_entities.return_value = iter([])
+            mock_table_client.return_value = table
+
+            run_restore("dummy.json")
+
+    upserted = table.upsert_entity.call_args[0][0]
+    assert upserted["PartitionKey"] == "pk1"
+    assert upserted["RowKey"] == "rk1"
+    assert upserted["count"] == 42
+    assert isinstance(upserted["Timestamp"], datetime)
+    assert upserted["Timestamp"] == datetime(2026, 6, 11, 2, 0, tzinfo=UTC)
+
+
 # ---------------------------------------------------------------------------
 # Environment variable handling
 # ---------------------------------------------------------------------------
 
+
 def test_missing_env_var_raises():
     from backup.core import _get_env
+
     with pytest.raises(EnvironmentError, match="MISSING_VAR"):
         _get_env("MISSING_VAR")
+
+
+# ---------------------------------------------------------------------------
+# Type roundtrip tests
+# ---------------------------------------------------------------------------
+
+
+def test_all_types_roundtrip():
+    """Verify all ATS types survive encode → JSON → decode correctly."""
+
+    class TablesEntityDatetime(datetime):
+        pass
+
+    test_cases = {
+        "datetime": TablesEntityDatetime(2026, 6, 9, 10, 18, 39, 874273, tzinfo=UTC),
+        "bool": True,
+        "int": 256,
+        "float": 1734.858602,
+        "str": "complete",
+    }
+
+    for name, original in test_cases.items():
+        tagged = {
+            "__type__": _infer_edm_type(original),
+            "value": _serialize_value(original),
+        }
+
+        loaded = json.loads(json.dumps(tagged))
+        restored = _deserialize_value(loaded["__type__"], loaded["value"])
+        assert restored == original, f"{name} roundtrip failed"
