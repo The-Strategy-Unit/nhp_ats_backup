@@ -139,7 +139,7 @@ def test_prune_excludes_status_blob():
     "os.environ",
     {
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
-        "MODEL_RUNS_TABLE_NAME": "mytable",
+        "PROD_TABLE_NAME": "mytable",
         "BACKUP_CONTAINER_NAME": "mycontainer",
     },
 )
@@ -184,7 +184,7 @@ def test_run_backup_uploads_snapshot_and_status(
     "os.environ",
     {
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
-        "MODEL_RUNS_TABLE_NAME": "mytable",
+        "PROD_TABLE_NAME": "mytable",
     },
 )
 def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc):
@@ -210,7 +210,7 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
     "os.environ",
     {
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
-        "MODEL_RUNS_TABLE_NAME": "mytable",
+        "PROD_TABLE_NAME": "mytable",
     },
 )
 def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock_tsc):
