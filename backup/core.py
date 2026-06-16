@@ -23,7 +23,7 @@ Restore (from latest snapshot):
     3. Re-create table if missing:
          az storage table create --name <table> --account-name <account>
     4. Restore entities:
-         python -m backup.core --restore restore.json
+        uv run python -m backup.core --restore restore.json
 """
 
 import json
@@ -43,6 +43,8 @@ STATUS_BLOB = "status.json"
 MAX_DAILY_SNAPSHOTS = 7
 MAX_MONTHLY_SNAPSHOTS = 6
 
+# Entity Data Model (EDM) types supported by Azure Table Storage.
+# https://learn.microsoft.com/en-us/rest/api/searchservice/supported-data-types
 SUPPORTED_EDM_TYPES = {
     "Edm.DateTime",
     "Edm.Boolean",
@@ -85,16 +87,14 @@ def _blob_client(credential: DefaultAzureCredential) -> BlobServiceClient:
 
 
 def _fetch_entities(table_client: TableClient) -> list[dict]:
-    """Fetch all entities with EDM type tags preserved."""
     tagged = []
     for e in table_client.list_entities():
         entity = {}
-        # Handle both real SDK entities (with .metadata) and plain dicts (tests)
-        metadata = getattr(e, "metadata", {})
         for key, value in e.items():
             if key.startswith("__"):
                 continue
-            edm_type = metadata.get("type", {}).get(key) if metadata else None
+            # Get EDM type from metadata, or infer from Python type
+            edm_type = e.metadata.get("type", {}).get(key) if e.metadata else None
             if not edm_type:
                 edm_type = _infer_edm_type(value)
             entity[key] = {"__type__": edm_type, "value": _serialise_value(value)}
@@ -105,7 +105,7 @@ def _fetch_entities(table_client: TableClient) -> list[dict]:
 def _infer_edm_type(value):
     """Guess EDM type from Python value."""
     type_name = type(value).__name__
-    if type_name == "datetime":
+    if type_name == "TablesEntityDatetime":
         return "Edm.DateTime"
     if isinstance(value, bool):
         return "Edm.Boolean"
@@ -117,7 +117,7 @@ def _infer_edm_type(value):
 
 
 def _serialise_value(value):
-    if type(value).__name__ == "datetime":
+    if type(value).__name__ == "TablesEntityDatetime":
         return value.isoformat()
     return value
 
