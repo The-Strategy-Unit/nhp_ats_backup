@@ -6,19 +6,19 @@ Usage (manual):
 
 Environment variables required:
     AZURE_STORAGE_ACCOUNT_NAME  : Storage account name
-    MODEL_RUNS_TABLE_NAME       : Table to back up
+    PROD_TABLE_NAME       : Table to back up
     BACKUP_CONTAINER_NAME       : Blob container for backups 
 
 Backup layout in blob storage:
-    YYYY-MM-DDTHH:MMZ.json   — daily snapshot (JSON, EDM-type-tagged)
-    status.json              — latest run status and validation hash (to be read by nhp_ats_tui)
+    YYYY-MM-DDTHH:MMZ.json   - daily snapshot (JSON, EDM-type-tagged)
+    status.json       - latest run status and validation hash (to be read by nhp_ats_tui)
 
 Snapshot strategy: full copy, not delta
     Rationale:
     - Current table: ~100 entries, ~180 KB per JSON snapshot.
     - Seven rolling full snapshots: ~1.3 MB total storage.
     - Azure Blob Storage (hot tier, UK South or UK West) costs £0.0142/GB/month.
-    - At this scale, annual storage cost is under 1p — negligible compared
+    - At this scale, annual storage cost is under 1p - negligible compared
       to the engineering time to implement, test, and maintain delta logic.
     - Delta chains introduce replay dependency (corrupt one delta, corrupt
       the whole chain), complicate hash validation, and require base-snapshot
@@ -83,10 +83,11 @@ def _credential() -> DefaultAzureCredential:
     return DefaultAzureCredential()
 
 
-def _table_client(credential: DefaultAzureCredential) -> TableClient:
-    """Build an authenticated TableClient from environment config."""
+def _table_client(
+    credential: DefaultAzureCredential, table_name: str | None = None
+) -> TableClient:
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
-    table = _get_env("MODEL_RUNS_TABLE_NAME")
+    table = table_name or _get_env("PROD_TABLE_NAME")
     endpoint = f"https://{account}.table.core.windows.net"
     return TableClient(endpoint=endpoint, table_name=table, credential=credential)
 
@@ -252,6 +253,13 @@ def _batch_clear_table(table: TableClient) -> int:
     return deleted
 
 
+def _get_restore_target() -> str:
+    env = os.environ.get("AZURE_FUNCTIONS_ENVIRONMENT", "Development")
+    if env == "Development":
+        return _get_env("DEV_TABLE_NAME")
+    return _get_env("PROD_TABLE_NAME")
+
+
 def run_restore(snapshot_path: str) -> None:
     """
     Restore all entities from a local JSON snapshot file.
@@ -265,14 +273,14 @@ def run_restore(snapshot_path: str) -> None:
     """
     credential = _credential()
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
-    table_name = _get_env("MODEL_RUNS_TABLE_NAME")
+    table_name = _get_restore_target()
     endpoint = f"https://{account}.table.core.windows.net"
 
     # Ensure table exists
     service = TableServiceClient(endpoint=endpoint, credential=credential)
     service.create_table_if_not_exists(table_name)
 
-    table = _table_client(credential)
+    table = _table_client(credential, table_name=table_name)
 
     before_count = sum(1 for _ in table.list_entities())
     logging.info("Entities before restore: %d", before_count)
