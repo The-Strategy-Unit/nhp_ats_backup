@@ -232,7 +232,13 @@ def _batch_clear_table(table: TableClient) -> int:
             deleted += len(batch)
             batch = []
         current_partition = pk
-        batch.append((TransactionOperation.DELETE, (pk, entity["RowKey"])))
+
+        batch.append(
+            (
+                TransactionOperation.DELETE,
+                {"PartitionKey": pk, "RowKey": entity["RowKey"]},
+            )
+        )
 
         if len(batch) == 100:
             table.submit_transaction(batch)
