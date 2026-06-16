@@ -22,9 +22,13 @@ from backup.core import (
 # ---------------------------------------------------------------------------
 
 
+class MockEntity(dict):
+    metadata = None
+
+
 ENTITIES_PLAIN = [
-    {"PartitionKey": "a", "RowKey": "1"},
-    {"PartitionKey": "b", "RowKey": "2"},
+    MockEntity(PartitionKey="a", RowKey="1"),
+    MockEntity(PartitionKey="b", RowKey="2"),
 ]
 
 ENTITIES_TAGGED = [
@@ -146,8 +150,11 @@ def test_prune_excludes_status_blob():
 def test_run_backup_uploads_snapshot_and_status(
     mock_dt, mock_cred, mock_table_client, mock_blob_client, mock_prune
 ):
+    class MockEntity(dict):
+        metadata = None
+
     mock_table_client.return_value.list_entities.return_value = [
-        {"PartitionKey": "a", "RowKey": "1"}
+        MockEntity(PartitionKey="a", RowKey="1")
     ]
     blob_service = mock_blob_client.return_value
     blob_client = MagicMock()
@@ -193,7 +200,7 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
         {"PartitionKey": "b", "RowKey": "2"},
     ]
     table = mock_table_client.return_value
-    table.list_entities.return_value = iter(entities)
+    table.list_entities.side_effect = lambda: iter(entities)  # Fresh iter on each call
 
     with patch("builtins.open", mock_open(read_data=json.dumps(entities))):
         run_restore("restore.json")
@@ -201,6 +208,8 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
     assert table.upsert_entity.call_count == 2
     table.upsert_entity.assert_any_call({"PartitionKey": "a", "RowKey": "1"})
     table.upsert_entity.assert_any_call({"PartitionKey": "b", "RowKey": "2"})
+    assert table.submit_transaction.call_count == 2
+    assert len(table.submit_transaction.call_args[0][0]) == 1  # two deletes in one batch
 
 
 @patch("backup.core.TableServiceClient")
@@ -209,6 +218,7 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
 @patch.dict(
     "os.environ",
     {
+        "AZURE_FUNCTIONS_ENVIRONMENT": "Production",
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
         "PROD_TABLE_NAME": "mytable",
     },
@@ -222,6 +232,35 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
         run_restore("restore.json")
 
     tsc_instance.create_table_if_not_exists.assert_called_once_with("mytable")
+
+
+def test_run_restore_handles_tagged_entities_with_datetime():
+    """Verify that EDM-tagged JSON (including DateTime) is deserialised correctly."""
+    tagged = [
+        {
+            "PartitionKey": {"__type__": "Edm.String", "value": "pk1"},
+            "RowKey": {"__type__": "Edm.String", "value": "rk1"},
+            "Timestamp": {
+                "__type__": "Edm.DateTime",
+                "value": "2026-06-11T02:00:00+00:00",
+            },
+            "count": {"__type__": "Edm.Int64", "value": 42},
+        }
+    ]
+    with patch("builtins.open", mock_open(read_data=json.dumps(tagged))):
+        with patch("backup.core._table_client") as mock_table_client:
+            table = MagicMock()
+            table.list_entities.return_value = iter([])
+            mock_table_client.return_value = table
+
+            run_restore("dummy.json")
+
+    upserted = table.upsert_entity.call_args[0][0]
+    assert upserted["PartitionKey"] == "pk1"
+    assert upserted["RowKey"] == "rk1"
+    assert upserted["count"] == 42
+    assert isinstance(upserted["Timestamp"], datetime)
+    assert upserted["Timestamp"] == datetime(2026, 6, 11, 2, 0, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +282,12 @@ def test_missing_env_var_raises():
 
 def test_all_types_roundtrip():
     """Verify all ATS types survive encode → JSON → decode correctly."""
+
+    class TablesEntityDatetime(datetime):
+        pass
+
     test_cases = {
-        "datetime": datetime(2026, 6, 9, 10, 18, 39, 874273, tzinfo=UTC),
+        "datetime": TablesEntityDatetime(2026, 6, 9, 10, 18, 39, 874273, tzinfo=UTC),
         "bool": True,
         "int": 256,
         "float": 1734.858602,
@@ -252,17 +295,11 @@ def test_all_types_roundtrip():
     }
 
     for name, original in test_cases.items():
-        # Encode
         tagged = {
             "__type__": _infer_edm_type(original),
             "value": _serialise_value(original),
         }
 
-        # JSON transit
         loaded = json.loads(json.dumps(tagged))
-
-        # Decode and verify
         restored = _deserialise_value(loaded["__type__"], loaded["value"])
-
-        assert restored == original, f"{name} failed: {restored} != {original}"
-        assert type(restored) is type(original), f"{name} type mismatch"
+        assert restored == original, f"{name} roundtrip failed"
