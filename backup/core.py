@@ -7,23 +7,36 @@ Usage (manual):
 Environment variables required:
     AZURE_STORAGE_ACCOUNT_NAME  : Storage account name
     MODEL_RUNS_TABLE_NAME       : Table to back up
-    BACKUP_CONTAINER_NAME       : Blob container for backups (e.g. 'nhp-backups')
+    BACKUP_CONTAINER_NAME       : Blob container for backups 
 
 Backup layout in blob storage:
-    ats-bak/YYYY-MM-DDTHH:MMZ.json   — snapshot
-    ats-bak/status.json              — latest run status (read by nhp_ats_tui)
+    YYYY-MM-DDTHH:MMZ.json   — daily snapshot (JSON, EDM-type-tagged)
+    status.json              — latest run status and validation hash (to be read by nhp_ats_tui)
+
+Snapshot strategy: full copy, not delta
+    Rationale:
+    - Current table: ~100 entries, ~180 KB per JSON snapshot.
+    - Seven rolling full snapshots: ~1.3 MB total storage.
+    - Azure Blob Storage (hot tier, UK South or UK West) costs £0.0142/GB/month.
+    - At this scale, annual storage cost is under 1p — negligible compared
+      to the engineering time to implement, test, and maintain delta logic.
+    - Delta chains introduce replay dependency (corrupt one delta, corrupt
+      the whole chain), complicate hash validation, and require base-snapshot
+      lifecycle management. These risks are not justified at this scale.
+    - Re-evaluate trigger: when annual storage cost exceeds the equivalent
+      of one hour of engineering time to implement and maintain delta logic.
 
 Restore (from latest snapshot):
     1. Identify latest snapshot:
          az storage blob list --account-name <account> --container-name <container> \
-             --prefix ats-bak/ --query "[].name" -o tsv | sort | tail -1
+             --query "[].name" -o tsv | grep -E '^\\d{4}-' | sort | tail -1
     2. Download:
          az storage blob download --account-name <account> \
-             --container-name <container> --name ats-bak/<filename> --file restore.json
+             --container-name <container> --name <filename> --file restore.json
     3. Re-create table if missing:
          az storage table create --name <table> --account-name <account>
     4. Restore entities:
-        uv run python -m backup.core --restore restore.json
+         uv run python -m backup.core --restore restore.json
 """
 
 import json
@@ -38,7 +51,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BACKUP_PREFIX = ""
 STATUS_BLOB = "status.json"
 MAX_DAILY_SNAPSHOTS = 7
 MAX_MONTHLY_SNAPSHOTS = 6
@@ -148,11 +160,7 @@ def _prune_snapshots(blob_service: BlobServiceClient, container: str) -> None:
     """Delete oldest snapshots, keeping only the last MAX_DAILY_SNAPSHOTS."""
     container_client = blob_service.get_container_client(container)
     blobs = sorted(
-        [
-            b.name
-            for b in container_client.list_blobs(name_starts_with=BACKUP_PREFIX)
-            if b.name != STATUS_BLOB
-        ]
+        [b.name for b in container_client.list_blobs() if b.name != STATUS_BLOB]
     )
 
     blobs = [b for b in blobs if b != STATUS_BLOB]  # Exclude status from count
@@ -174,7 +182,7 @@ def run_backup() -> None:
     entity_count = len(entities)
     logging.info("Fetched %d entities.", entity_count)
 
-    snapshot_name = f"{BACKUP_PREFIX}{started_at.strftime('%Y-%m-%dT%H:%MZ')}.json"
+    snapshot_name = f"{started_at.strftime('%Y-%m-%dT%H:%MZ')}.json"
     blob_service = _blob_client(credential)
 
     logging.info("Uploading snapshot: %s", snapshot_name)
