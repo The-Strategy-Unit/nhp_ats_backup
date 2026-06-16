@@ -44,7 +44,7 @@ import logging
 import os
 from datetime import UTC, datetime
 
-from azure.data.tables import TableClient, TableServiceClient
+from azure.data.tables import TableClient, TableServiceClient, TransactionOperation
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
@@ -205,6 +205,47 @@ def run_backup() -> None:
     logging.info("Backup complete. status.json updated.")
 
 
+def _batch_clear_table(table: TableClient) -> int:
+    """
+    Delete all entities using batch transactions. Returns count deleted.
+
+    Why delete: Azure Table Storage has no 'truncate' command. If pre-existing
+    rows (different RowKey, or same RowKey with divergent properties) remain
+    untouched, the restored table is not identical to the snapshot. We must
+    delete everything before inserting the snapshot to guarantee fidelity.
+
+    Why batches: Each transaction is limited to 100 operations and must target
+    a single PartitionKey. Batch deletes minimise round-trips (100× fewer API
+    calls than individual deletes) and keep the operation atomic per partition.
+    At current scale this is negligible; the pattern is chosen for correctness
+    at any scale.
+    """
+
+    deleted = 0
+    batch = []
+    current_partition = None
+
+    for entity in table.list_entities():
+        pk = entity["PartitionKey"]
+        if pk != current_partition and batch:
+            table.submit_transaction(batch)
+            deleted += len(batch)
+            batch = []
+        current_partition = pk
+        batch.append((TransactionOperation.DELETE, (pk, entity["RowKey"])))
+
+        if len(batch) == 100:
+            table.submit_transaction(batch)
+            deleted += len(batch)
+            batch = []
+
+    if batch:
+        table.submit_transaction(batch)
+        deleted += len(batch)
+
+    return deleted
+
+
 def run_restore(snapshot_path: str) -> None:
     """
     Restore all entities from a local JSON snapshot file.
@@ -229,6 +270,9 @@ def run_restore(snapshot_path: str) -> None:
 
     before_count = sum(1 for _ in table.list_entities())
     logging.info("Entities before restore: %d", before_count)
+
+    cleared = _batch_clear_table(table)
+    logging.info("Deleted %d existing entities in batches before restore.", cleared)
 
     with open(snapshot_path) as f:
         tagged_entities = json.load(f)
