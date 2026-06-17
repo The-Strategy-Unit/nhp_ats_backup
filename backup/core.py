@@ -86,8 +86,19 @@ def _credential() -> DefaultAzureCredential:
 def _table_client(
     credential: DefaultAzureCredential, table_name: str | None = None
 ) -> TableClient:
+    """
+    Build a TableClient for the given Azure Table Storage table.
+
+    Args:
+        credential: An Azure credential (e.g. DefaultAzureCredential).
+        table_name: Explicit table name. If omitted, falls back to PROD_TABLE_NAME.
+
+    Returns:
+        A TableClient pointing to https://{account}.table.core.windows.net.
+    """
+
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
-    table = table_name or _get_env("PROD_TABLE_NAME")
+    table = table_name if table_name is not None else _get_env("PROD_TABLE_NAME")
     endpoint = f"https://{account}.table.core.windows.net"
     return TableClient(endpoint=endpoint, table_name=table, credential=credential)
 
@@ -171,14 +182,14 @@ def _prune_snapshots(blob_service: BlobServiceClient, container: str) -> None:
             logging.info("Pruned old snapshot: %s", old)
 
 
-def run_backup() -> None:
+def run_backup(source_table=None) -> None:
     """Run a full backup cycle: snapshot → upload → prune → write status."""
     started_at = datetime.now(UTC)
     container = _get_env("BACKUP_CONTAINER_NAME")
     credential = _credential()
 
     logging.info("Connecting to table...")
-    table = _table_client(credential)
+    table = _table_client(credential, table_name=source_table)
     entities = _fetch_entities(table)
     entity_count = len(entities)
     logging.info("Fetched %d entities.", entity_count)
@@ -186,7 +197,7 @@ def run_backup() -> None:
     snapshot_name = f"{started_at.strftime('%Y-%m-%dT%H:%MZ')}.json"
     blob_service = _blob_client(credential)
 
-    logging.info("Uploading snapshot: %s", snapshot_name)
+    logging.info("Uploading snapshot JSON blob: %s", snapshot_name)
     _upload_blob(
         blob_service,
         container,
@@ -260,7 +271,7 @@ def _get_restore_target() -> str:
     return _get_env("PROD_TABLE_NAME")
 
 
-def run_restore(snapshot_path: str) -> None:
+def run_restore(snapshot_path: str, target_table=None) -> None:
     """
     Restore all entities from a local JSON snapshot file.
 
@@ -273,7 +284,7 @@ def run_restore(snapshot_path: str) -> None:
     """
     credential = _credential()
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
-    table_name = _get_restore_target()
+    table_name = target_table if target_table is not None else _get_restore_target()
     endpoint = f"https://{account}.table.core.windows.net"
 
     # Ensure table exists
@@ -314,9 +325,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--restore", metavar="FILE", help="Restore from a local snapshot JSON file."
     )
+
+    parser.add_argument("--source-table", help="Override table to back up from")
+    parser.add_argument("--target-table", help="Override table to restore into")
     args = parser.parse_args()
 
     if args.restore:
-        run_restore(args.restore)
+        run_restore(args.restore, target_table=args.target_table)
     else:
-        run_backup()
+        run_backup(source_table=args.source_table)
