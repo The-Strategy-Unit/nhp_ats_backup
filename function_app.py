@@ -18,3 +18,10 @@ def ats_backup(timer: func.TimerRequest) -> None:
     if timer.past_due:
         logging.warning("Timer is past due.")
     run_backup()
+
+
+@app.route(route="dev-backup", auth_level=func.AuthLevel.FUNCTION)
+def dev_ats_backup(req: func.HttpRequest) -> func.HttpResponse:
+    """Manual trigger for dev ATS backup testing."""
+    run_backup()
+    return func.HttpResponse("Dev backup completed", status_code=200)
