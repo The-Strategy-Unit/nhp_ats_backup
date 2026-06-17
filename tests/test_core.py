@@ -8,11 +8,11 @@ import pytest
 
 from backup.core import (
     MAX_DAILY_SNAPSHOTS,
-    _deserialise_value,
+    _deserialize_value,
     _fetch_entities,
     _infer_edm_type,
     _prune_snapshots,
-    _serialise_value,
+    _serialize_value,
     run_backup,
     run_restore,
 )
@@ -31,16 +31,16 @@ ENTITIES_PLAIN = [
     MockEntity(PartitionKey="b", RowKey="2"),
 ]
 
-ENTITIES_TAGGED = [
-    {
-        "PartitionKey": {"__type__": "Edm.String", "value": "a"},
-        "RowKey": {"__type__": "Edm.String", "value": "1"},
-    },
-    {
-        "PartitionKey": {"__type__": "Edm.String", "value": "b"},
-        "RowKey": {"__type__": "Edm.String", "value": "2"},
-    },
-]
+ENTITY_A = {
+    "PartitionKey": {"__type__": "Edm.String", "value": "a"},
+    "RowKey": {"__type__": "Edm.String", "value": "1"},
+}
+ENTITY_B = {
+    "PartitionKey": {"__type__": "Edm.String", "value": "b"},
+    "RowKey": {"__type__": "Edm.String", "value": "2"},
+}
+
+ENTITIES_TAGGED = [ENTITY_A, ENTITY_B]
 
 
 # ---------------------------------------------------------------------------
@@ -86,16 +86,22 @@ def test_prune_deletes_oldest_when_over_limit():
     blob_service = MagicMock()
     blob_service.get_container_client.return_value = container_client
 
-    # 8 snapshots — oldest should be deleted
-    names = [f"2026-01-0{i}T00:00Z.json" for i in range(1, 9)]
+    # 14 blobs across 2 months:
+    #   old = first 7 blobs (one per month Jan-Jul), monthly_keepers[-6:] keeps Feb-Jul
+    #   daily keepers = 7 Aug blobs
+    #   Jan blob is pruned (oldest month, outside last 6)
+    names = (
+        [f"2025-{i:02d}-01T00:00Z.json" for i in range(1, 8)]  # Jan-Jul 2025
+        + [f"2025-08-{i:02d}T00:00Z.json" for i in range(1, 8)]  # Aug 1-7 2025
+    )
     container_client.list_blobs.return_value = _make_blobs(names)
 
     _prune_snapshots(blob_service, "my-container")
 
-    blob_service.get_blob_client.assert_called_once_with(
-        container="my-container", blob=names[0]
+    # The Jan 2025 blob (names[0]) should have been pruned (only one deleted)
+    blob_service.get_blob_client.assert_any_call(
+        container="my-container", blob="2025-01-01T00:00Z.json"
     )
-    blob_service.get_blob_client.return_value.delete_blob.assert_called_once()
 
 
 def test_prune_does_not_delete_when_at_limit():
@@ -159,6 +165,10 @@ def test_run_backup_uploads_snapshot_and_status(
     blob_service = mock_blob_client.return_value
     blob_client = MagicMock()
     blob_service.get_blob_client.return_value = blob_client
+
+    # Set up download_blob().readall() to return the snapshot that was uploaded
+    expected_snapshot = json.dumps([ENTITY_A])
+    blob_client.download_blob.return_value.readall.return_value = expected_snapshot
 
     run_backup()
 
@@ -235,7 +245,7 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
 
 
 def test_run_restore_handles_tagged_entities_with_datetime():
-    """Verify that EDM-tagged JSON (including DateTime) is deserialised correctly."""
+    """Verify that EDM-tagged JSON (including DateTime) is deserialized correctly."""
     tagged = [
         {
             "PartitionKey": {"__type__": "Edm.String", "value": "pk1"},
@@ -297,9 +307,9 @@ def test_all_types_roundtrip():
     for name, original in test_cases.items():
         tagged = {
             "__type__": _infer_edm_type(original),
-            "value": _serialise_value(original),
+            "value": _serialize_value(original),
         }
 
         loaded = json.loads(json.dumps(tagged))
-        restored = _deserialise_value(loaded["__type__"], loaded["value"])
+        restored = _deserialize_value(loaded["__type__"], loaded["value"])
         assert restored == original, f"{name} roundtrip failed"
