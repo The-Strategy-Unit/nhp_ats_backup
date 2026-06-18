@@ -33,6 +33,24 @@ Azure's remote build uses pip, not uv. Compile a lockfile before every deploy:
 uv pip compile pyproject.toml -o requirements.txt
 ```
 
+### 1.5. Prepare `.funcignore`
+
+Ensure `.funcignore` exists so the publish step skips your local venv and build artifacts:
+
+```text
+.venv
+__pycache__
+.git
+.env
+local.settings.json
+.ruff_cache
+.pytest_cache
+tests/
+*.egg-info
+*.pyc
+.github/
+```
+
 ### 2. Publish
 
 ```bash
@@ -134,6 +152,7 @@ Create `local.settings.json`:
   "Values": {
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AZURE_FUNCTIONS_ENVIRONMENT": "Development",
     "AZURE_STORAGE_ACCOUNT_NAME": "<your-account>",
     "PROD_TABLE_NAME": "<your-table>",
     "BACKUP_CONTAINER_NAME": "<your-container>",
