@@ -13,15 +13,15 @@ app = func.FunctionApp()
     run_on_startup=False,  # avoid spurious backup every time Function App cold-starts
     use_monitor=True,  # Az persists checkpoint; won't re-fire on mid-schedule restart
 )
-def ats_backup(timer: func.TimerRequest) -> None:
+def nhp_ats_backup(timer: func.TimerRequest) -> None:
     """Daily backup of Azure Table Storage to blob."""
     if timer.past_due:
         logging.warning("Timer is past due.")
     run_backup()
 
 
-@app.route(route="dev-backup", auth_level=func.AuthLevel.FUNCTION)
-def dev_ats_backup(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="nhp-ats-backup-dev", auth_level=func.AuthLevel.FUNCTION)
+def nhp_ats_backup_dev(req: func.HttpRequest) -> func.HttpResponse:
     """Manual trigger for dev ATS backup testing."""
     run_backup()
     return func.HttpResponse("Dev backup completed", status_code=200)
