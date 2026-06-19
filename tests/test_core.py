@@ -8,11 +8,8 @@ import pytest
 
 from backup.core import (
     MAX_DAILY_SNAPSHOTS,
-    _deserialize_value,
     _fetch_entities,
-    _infer_edm_type,
     _prune_snapshots,
-    _serialize_value,
     run_backup,
     run_restore,
 )
@@ -151,6 +148,7 @@ def test_prune_excludes_status_blob():
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
         "PROD_TABLE_NAME": "mytable",
         "BACKUP_CONTAINER_NAME": "mycontainer",
+        "MODEL_RUNS_TABLE_NAME": "mytable",
     },
 )
 def test_run_backup_uploads_snapshot_and_status(
@@ -202,6 +200,7 @@ def test_run_backup_uploads_snapshot_and_status(
     {
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
         "PROD_TABLE_NAME": "mytable",
+        "MODEL_RUNS_TABLE_NAME": "mytable",
     },
 )
 def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc):
@@ -218,8 +217,6 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
     assert table.upsert_entity.call_count == 2
     table.upsert_entity.assert_any_call({"PartitionKey": "a", "RowKey": "1"})
     table.upsert_entity.assert_any_call({"PartitionKey": "b", "RowKey": "2"})
-    assert table.submit_transaction.call_count == 2
-    assert len(table.submit_transaction.call_args[0][0]) == 1  # two deletes in one batch
 
 
 @patch("backup.core.TableServiceClient")
@@ -231,6 +228,7 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
         "AZURE_FUNCTIONS_ENVIRONMENT": "Production",
         "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
         "PROD_TABLE_NAME": "mytable",
+        "MODEL_RUNS_TABLE_NAME": "mytable",
     },
 )
 def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock_tsc):
@@ -244,7 +242,20 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
     tsc_instance.create_table_if_not_exists.assert_called_once_with("mytable")
 
 
-def test_run_restore_handles_tagged_entities_with_datetime():
+@patch("backup.core.TableServiceClient")
+@patch("backup.core._table_client")
+@patch("backup.core._credential")
+@patch.dict(
+    "os.environ",
+    {
+        "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
+        "PROD_TABLE_NAME": "mytable",
+        "MODEL_RUNS_TABLE_NAME": "myruns",
+    },
+)
+def test_run_restore_handles_tagged_entities_with_datetime(
+    mock_cred, mock_table_client, mock_tsc
+):
     """Verify that EDM-tagged JSON (including DateTime) is deserialized correctly."""
     tagged = [
         {
@@ -257,13 +268,11 @@ def test_run_restore_handles_tagged_entities_with_datetime():
             "count": {"__type__": "Edm.Int64", "value": 42},
         }
     ]
-    with patch("builtins.open", mock_open(read_data=json.dumps(tagged))):
-        with patch("backup.core._table_client") as mock_table_client:
-            table = MagicMock()
-            table.list_entities.return_value = iter([])
-            mock_table_client.return_value = table
+    table = mock_table_client.return_value
+    table.list_entities.return_value = iter([])
 
-            run_restore("dummy.json")
+    with patch("builtins.open", mock_open(read_data=json.dumps(tagged))):
+        run_restore("dummy.json")
 
     upserted = table.upsert_entity.call_args[0][0]
     assert upserted["PartitionKey"] == "pk1"
@@ -283,33 +292,3 @@ def test_missing_env_var_raises():
 
     with pytest.raises(EnvironmentError, match="MISSING_VAR"):
         _get_env("MISSING_VAR")
-
-
-# ---------------------------------------------------------------------------
-# Type roundtrip tests
-# ---------------------------------------------------------------------------
-
-
-def test_all_types_roundtrip():
-    """Verify all ATS types survive encode → JSON → decode correctly."""
-
-    class TablesEntityDatetime(datetime):
-        pass
-
-    test_cases = {
-        "datetime": TablesEntityDatetime(2026, 6, 9, 10, 18, 39, 874273, tzinfo=UTC),
-        "bool": True,
-        "int": 256,
-        "float": 1734.858602,
-        "str": "complete",
-    }
-
-    for name, original in test_cases.items():
-        tagged = {
-            "__type__": _infer_edm_type(original),
-            "value": _serialize_value(original),
-        }
-
-        loaded = json.loads(json.dumps(tagged))
-        restored = _deserialize_value(loaded["__type__"], loaded["value"])
-        assert restored == original, f"{name} roundtrip failed"

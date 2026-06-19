@@ -10,8 +10,8 @@ Environment variables required:
     BACKUP_CONTAINER_NAME       : Blob container for backups 
 
 Backup layout in blob storage:
-    YYYY-MM-DDTHH:MMZ.json   — daily snapshot (JSON, EDM-type-tagged)
-    status.json              — latest run status and validation hash (to be read by nhp_ats_tui)
+    YYYY-MM-DDTHH:MMZ.json   - daily snapshot (JSON, EDM-type-tagged)
+    status.json     - latest run status and validation hash (to be read by nhp_ats_tui)
 
 Snapshot strategy: full copy, not delta
     Rationale:
