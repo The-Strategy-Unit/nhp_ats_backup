@@ -51,7 +51,7 @@ def _download_snapshot(name: str) -> str:
     container = _get_env("BACKUP_CONTAINER_NAME")
     blob_service = _blob_client(cred)
     client = blob_service.get_blob_client(container=container, blob=name)
-    local_path = name
+    local_path = os.path.basename(name).replace("%3A", ":").replace(":", "_")
     with open(local_path, "wb") as f:
         f.write(client.download_blob().readall())
     print(f"Downloaded snapshot -> {local_path}")
@@ -159,6 +159,9 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nAborted.")
         return 130
+    except Exception as e:
+        print(f"Failed: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
