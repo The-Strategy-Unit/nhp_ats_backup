@@ -23,7 +23,7 @@ Windows users should omit `export` or use `set` instead.
 
 ## Quick deploy
 
-This project uses **Azure Functions on Linux Consumption** (Python 3.13).
+This project uses **Azure Functions on Flex Consumption** (Python 3.13).
 
 ### 1. Generate `requirements.txt`
 
@@ -35,7 +35,7 @@ uv pip compile pyproject.toml -o requirements.txt
 
 ### 1.5. Prepare `.funcignore`
 
-Ensure `.funcignore` exists so the publish step skips your local venv and build artifacts:
+Ensure `.funcignore` exists so the publish step skips your local venv and build artefacts:
 
 ```text
 .venv
@@ -112,30 +112,24 @@ uv run --env-file .env python -m backup.core --restore snapshot.json --target-ta
 <details>
 <summary><b>Azure Function setup (first time)</b></summary>
 
-We use the standard Consumption plan rather than Flex Consumption because of current Python 3.13 portal support and deployment tooling limitations.
-
 ```bash
 az functionapp create \
   --resource-group <your-rg> \
   --name <new-app-name> \
   --storage-account <your-storage> \
-  --os-type Linux \
+  --flexconsumption-location <region> \
   --runtime python \
   --runtime-version 3.13 \
   --functions-version 4 \
-  --consumption-plan-location <region>
-```
+  --instance-memory 2048
 
-Then set app settings:
-
-```bash
 az functionapp config appsettings set \
   --name <your-app-name> \
   --resource-group <your-rg> \
   --settings \
     'AZURE_STORAGE_ACCOUNT_NAME=<your-account>' \
     'PROD_TABLE_NAME=<your-table>' \
-    'BACKUP_CONTAINER_NAME=<backup-container-name> ' \
+    'BACKUP_CONTAINER_NAME=<backup-container-name>' \
     'DEV_TABLE_NAME=<your-dev-table>'
 ```
 
