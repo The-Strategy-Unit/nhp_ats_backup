@@ -159,6 +159,9 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nAborted.")
         return 130
+    except Exception as e:
+        print(f"Failed: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
