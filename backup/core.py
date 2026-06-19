@@ -55,8 +55,9 @@ STATUS_BLOB = "status.json"
 MAX_DAILY_SNAPSHOTS = 7
 MAX_MONTHLY_SNAPSHOTS = 6
 
-# Entity Data Model (EDM) types supported by Azure Table Storage.
-# https://learn.microsoft.com/en-us/rest/api/searchservice/supported-data-types
+# Subset of Entity Data Model (EDM) types supported by this tool for
+# Azure Table Storage round-tripping.
+# https://learn.microsoft.com/en-us/rest/api/storageservices/understanding-the-table-service-data-model#property-types
 SUPPORTED_EDM_TYPES = {
     "Edm.DateTime",
     "Edm.Boolean",
