@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 try:
@@ -16,7 +15,11 @@ except ImportError:
     logging.error("python-dotenv is required. Install with: uv add --dev python-dotenv")
     raise
 
-ROOT = Path(__file__).parent
+try:
+    ROOT = Path(__file__).resolve().parent
+except NameError:
+    ROOT = Path.cwd()
+
 load_dotenv(ROOT / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -58,8 +61,18 @@ def ask(prompt, auto_yes):
     return resp in {"y", "yes"}
 
 
+def _cache_key(cmd):
+    return tuple(cmd)
+
+
+def clear_cache(*cmd_fragments: str) -> None:
+    for key in list(_CMD_CACHE):
+        if all(fragment in key for fragment in cmd_fragments):
+            _CMD_CACHE.pop(key, None)
+
+
 def _show_json(cmd):
-    key = tuple(cmd)
+    key = _cache_key(cmd)
     if key in _CMD_CACHE:
         return _CMD_CACHE[key]
     result = run(cmd + ["--output", "json"], check=False, capture_output=True)
@@ -78,15 +91,8 @@ def resource_group_exists(name):
     return bool(_show_json(["az", "group", "show", "--name", name]))
 
 
-def storage_account_in_rg(name, rg, location):
-    data = _show_json(["az", "storage", "account", "show", "--name", name])
-    if not data:
-        return False, None
-    in_place = (
-        data.get("resourceGroup", "").lower() == rg.lower()
-        and data.get("primaryLocation", "").lower() == location.lower()
-    )
-    return in_place, data
+def _norm_loc(loc: str) -> str:
+    return loc.lower().replace(" ", "")
 
 
 def function_app_in_rg(name, rg, location):
@@ -95,14 +101,23 @@ def function_app_in_rg(name, rg, location):
     )
     if not data:
         return False, None
-    in_place = (
-        data.get("resourceGroup", "").lower() == rg.lower()
-        and data.get("location", "").lower() == location.lower()
-    )
+    in_place = data.get("resourceGroup", "").lower() == rg.lower() and _norm_loc(
+        data.get("location", "")
+    ) == _norm_loc(location)
     return in_place, data
 
 
-def blob_container_exists(account, container):
+def storage_account_in_rg(name, rg, location):
+    data = _show_json(["az", "storage", "account", "show", "--name", name])
+    if not data:
+        return False, None
+    in_place = data.get("resourceGroup", "").lower() == rg.lower() and _norm_loc(
+        data.get("primaryLocation", "")
+    ) == _norm_loc(location)
+    return in_place, data
+
+
+def blob_container_exists(account, container, auth_mode):
     data = _show_json(
         [
             "az",
@@ -113,6 +128,8 @@ def blob_container_exists(account, container):
             container,
             "--account-name",
             account,
+            "--auth-mode",
+            auth_mode,
         ]
     )
     return bool(data and data.get("name") == container)
@@ -166,6 +183,7 @@ def main():
     app = env["AZURE_FUNCTION_APP_NAME"]
     py_version = os.environ.get("AZURE_PYTHON_VERSION", "3.13")
     memory = os.environ.get("AZURE_FUNCTION_INSTANCE_MEMORY", "2048")
+    auth_mode = os.environ.get("AZURE_STORAGE_AUTH_MODE", "login")
 
     # Resource group
     if resource_group_exists(rg):
@@ -173,6 +191,7 @@ def main():
     else:
         if ask(f"Create resource group '{rg}' in '{location}'?", args.yes):
             run(["az", "group", "create", "--name", rg, "--location", location])
+            clear_cache("az", "group", "show")
         else:
             raise SystemExit("Aborted.")
 
@@ -208,11 +227,12 @@ def main():
                 ],
                 capture_output=False,
             )
+            clear_cache("az", "storage", "account", "show")
         else:
             raise SystemExit("Aborted.")
 
     # Backup container
-    if blob_container_exists(storage, container):
+    if blob_container_exists(storage, container, auth_mode):
         logging.warning("Blob container '%s' already exists.", container)
     else:
         if ask(f"Create blob container '{container}'?", args.yes):
@@ -227,10 +247,11 @@ def main():
                     "--account-name",
                     storage,
                     "--auth-mode",
-                    "login",
+                    auth_mode,
                 ],
                 capture_output=False,
             )
+            clear_cache("az", "storage", "container", "show")
         else:
             raise SystemExit("Aborted.")
 
@@ -269,6 +290,7 @@ def main():
                 ],
                 capture_output=False,
             )
+            clear_cache("az", "functionapp", "show")
         else:
             raise SystemExit("Aborted.")
 
@@ -295,6 +317,7 @@ def main():
         ]
         sensitive_indices = set(range(len(cmd) - len(settings), len(cmd)))
         run(cmd, capture_output=False, _sensitive_indices=sensitive_indices)
+        clear_cache("az", "functionapp", "show")
 
     # Publish
     _ensure_requirements_txt(ROOT)

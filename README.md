@@ -14,6 +14,7 @@ Create a `.env` file in the repo root by copying and filling in the values below
 
 ```bash
 # Azure resources
+AZURE_STORAGE_AUTH_MODE=login                  # Use Azure CLI login for storage account access; no key or connection string needed
 AZURE_STORAGE_ACCOUNT_NAME=<storage-name>      # Globally unique, lowercase letters+numbers, 3-24 chars
 AZURE_RESOURCE_GROUP_NAME=<resource-group>     # Existing resource group where resources are created
 AZURE_LOCATION=<region>                        # e.g. australiaeast; pick one near your users
@@ -241,9 +242,9 @@ curl http://localhost:7071/admin/functions/nhp_ats_backup -X POST -d '{}'
 <details>
 <summary><b>Click to expand</b></summary>
 
-- `backup/core.py` — library functions and non-interactive backup/restore
-- `backup/cli.py` — interactive workflow and snapshot resolution
-- `function_app.py` — Azure Function entrypoint (timer + HTTP)
+- `backup/core.py` - library functions and non-interactive backup/restore
+- `backup/cli.py` - interactive workflow and snapshot resolution
+- `function_app.py` - Azure Function entrypoint (timer + HTTP)
 
 ### Snapshots
 - JSON format with EDM type tags for perfect round-trip fidelity
