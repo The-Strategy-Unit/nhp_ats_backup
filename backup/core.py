@@ -6,19 +6,20 @@ Usage (manual):
 
 Environment variables required:
     AZURE_STORAGE_ACCOUNT_NAME  : Storage account name
-    MODEL_RUNS_TABLE_NAME       : Table to back up
+    PROD_TABLE_NAME       : Table to back up
     BACKUP_CONTAINER_NAME       : Blob container for backups 
 
 Backup layout in blob storage:
     YYYY-MM-DDTHH:MMZ.json   - daily snapshot (JSON, EDM-type-tagged)
     status.json     - latest run status and validation hash (to be read by nhp_ats_tui)
 
+
 Snapshot strategy: full copy, not delta
     Rationale:
     - Current table: ~100 entries, ~180 KB per JSON snapshot.
     - Seven rolling full snapshots: ~1.3 MB total storage.
     - Azure Blob Storage (hot tier, UK South or UK West) costs £0.0142/GB/month.
-    - At this scale, annual storage cost is under 1p — negligible compared
+    - At this scale, annual storage cost is under 1p - negligible compared
       to the engineering time to implement, test, and maintain delta logic.
     - Delta chains introduce replay dependency (corrupt one delta, corrupt
       the whole chain), complicate hash validation, and require base-snapshot
@@ -68,10 +69,19 @@ SUPPORTED_EDM_TYPES = {
 
 
 def _get_env(name: str) -> str:
-    """Retrieve a required environment variable, raising clearly if absent."""
+    """
+    Retrieve a required environment variable, raising clearly if absent.
+
+    Args:
+        name: The name of the environment variable to retrieve.
+
+    Returns:
+        The value of the environment variable.
+    """
     value = os.environ.get(name)
     if not value:
         raise EnvironmentError(f"Required environment variable not set: {name}")
+
     return value
 
 
@@ -79,26 +89,63 @@ def _credential() -> DefaultAzureCredential:
     """
     Return a DefaultAzureCredential,
     using managed identity in Azure and CLI auth locally.
+
+    Args:
+        None
+
+    Returns:
+        An instance of DefaultAzureCredential for authenticating with Azure services.
     """
+
     return DefaultAzureCredential()
 
 
-def _table_client(credential: DefaultAzureCredential) -> TableClient:
-    """Build an authenticated TableClient from environment config."""
+def _table_client(
+    credential: DefaultAzureCredential, table_name: str | None = None
+) -> TableClient:
+    """
+    Build a TableClient for the given Azure Table Storage table.
+
+    Args:
+        credential: An Azure credential (e.g. DefaultAzureCredential).
+        table_name: Explicit table name. If omitted, falls back to PROD_TABLE_NAME.
+
+    Returns:
+        A TableClient pointing to https://{account}.table.core.windows.net.
+    """
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
-    table = _get_env("MODEL_RUNS_TABLE_NAME")
+    table = table_name if table_name is not None else _get_env("PROD_TABLE_NAME")
     endpoint = f"https://{account}.table.core.windows.net"
+
     return TableClient(endpoint=endpoint, table_name=table, credential=credential)
 
 
 def _blob_client(credential: DefaultAzureCredential) -> BlobServiceClient:
-    """Build an authenticated BlobServiceClient from environment config."""
+    """
+    Build an authenticated BlobServiceClient from environment config.
+
+    Args:
+        credential: An Azure credential (e.g. DefaultAzureCredential).
+
+    Returns:
+        A BlobServiceClient pointing to https://{account}.blob.core.windows.net.
+    """
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
     endpoint = f"https://{account}.blob.core.windows.net"
+
     return BlobServiceClient(account_url=endpoint, credential=credential)
 
 
 def _fetch_entities(table_client: TableClient) -> list[dict]:
+    """
+    Fetch all entities from the given table and return them as a list of EDM-tagged dicts.
+
+    Args:
+        table_client: An authenticated TableClient for the source table.
+
+    Returns:
+        A list of dicts, each representing an entity with EDM type tags for serialization.
+    """
     tagged = []
     for e in table_client.list_entities():
         entity = {}
@@ -109,13 +156,22 @@ def _fetch_entities(table_client: TableClient) -> list[dict]:
             edm_type = e.metadata.get("type", {}).get(key) if e.metadata else None
             if not edm_type:
                 edm_type = _infer_edm_type(value)
-            entity[key] = {"__type__": edm_type, "value": _serialise_value(value)}
+            entity[key] = {"__type__": edm_type, "value": _serialize_value(value)}
         tagged.append(entity)
+
     return tagged
 
 
 def _infer_edm_type(value):
-    """Guess EDM type from Python value."""
+    """
+    Guess EDM type from Python value.
+
+    Args:
+        value: A Python value (str, int, float, bool, datetime, etc.)
+
+    Returns:
+        A string representing the corresponding EDM type.
+    """
     type_name = type(value).__name__
     if type_name == "TablesEntityDatetime":
         return "Edm.DateTime"
@@ -128,13 +184,33 @@ def _infer_edm_type(value):
     return "Edm.String"
 
 
-def _serialise_value(value):
+def _serialize_value(value):
+    """
+    Convert a TablesEntityDatetime to ISO 8601 string for JSON serialization.
+
+    Args:
+        value: A Python value, potentially a TablesEntityDatetime.
+
+    Returns:
+        The value converted to a JSON-serializable format (ISO string for datetime).
+    """
     if type(value).__name__ == "TablesEntityDatetime":
         return value.isoformat()
+
     return value
 
 
-def _deserialise_value(edm_type: str, value):
+def _deserialize_value(edm_type: str, value):
+    """
+    Convert a value from its EDM type to a Python type.
+
+    Args:
+        edm_type: The EDM type string (e.g., "Edm.DateTime", "Edm.Boolean").
+        value: The value to convert.
+
+    Returns:
+        The value converted to the corresponding Python type.
+    """
     if edm_type not in SUPPORTED_EDM_TYPES:
         raise ValueError(f"Unsupported EDM type: {edm_type}")
     if "DateTime" in edm_type:
@@ -151,33 +227,102 @@ def _deserialise_value(edm_type: str, value):
 def _upload_blob(
     blob_service: BlobServiceClient, container: str, name: str, data: str
 ) -> None:
-    """Upload a string payload to a blob, overwriting if it already exists."""
+    """
+    Upload a string payload to a blob, overwriting if it already exists.
+
+    Args:
+        blob_service: An authenticated BlobServiceClient.
+        container: The name of the blob container.
+        name: The name of the blob to create or overwrite.
+        data: The string data to upload to the blob.
+
+    Returns:
+        None. Raises exceptions on failure.
+    """
     client = blob_service.get_blob_client(container=container, blob=name)
     client.upload_blob(data, overwrite=True)
 
 
 def _prune_snapshots(blob_service: BlobServiceClient, container: str) -> None:
-    """Delete oldest snapshots, keeping only the last MAX_DAILY_SNAPSHOTS."""
+    """
+    Delete oldest snapshots, keeping the last MAX_DAILY_SNAPSHOTS dailies
+    plus the latest snapshot from each of the last MAX_MONTHLY_SNAPSHOTS months.
+
+    Args:
+        blob_service: An authenticated BlobServiceClient.
+        container: The name of the blob container.
+
+    Returns:
+        None. Raises exceptions on failure.
+    """
     container_client = blob_service.get_container_client(container)
-    blobs = sorted(
-        [b.name for b in container_client.list_blobs() if b.name != STATUS_BLOB]
+    snapshots = sorted(
+        b.name for b in container_client.list_blobs() if b.name != STATUS_BLOB
     )
 
-    blobs = [b for b in blobs if b != STATUS_BLOB]  # Exclude status from count
-    if len(blobs) > MAX_DAILY_SNAPSHOTS:
-        for old in blobs[:-MAX_DAILY_SNAPSHOTS]:
-            blob_service.get_blob_client(container=container, blob=old).delete_blob()
-            logging.info("Pruned old snapshot: %s", old)
+    if len(snapshots) <= MAX_DAILY_SNAPSHOTS:
+        return
+
+    keep = set(snapshots[-MAX_DAILY_SNAPSHOTS:])
+
+    # From older snapshots, keep the latest from each month
+    old = snapshots[:-MAX_DAILY_SNAPSHOTS]
+    by_month = {}
+    for name in old:
+        month = name[:7]  # "YYYY-MM"
+        by_month.setdefault(month, []).append(name)
+
+    monthly_keepers = sorted(max(names) for names in by_month.values())
+    keep.update(monthly_keepers[-MAX_MONTHLY_SNAPSHOTS:])
+
+    for name in snapshots:
+        if name not in keep:
+            blob_service.get_blob_client(container=container, blob=name).delete_blob()
+            logging.info("Pruned old snapshot: %s", name)
 
 
-def run_backup() -> None:
-    """Run a full backup cycle: snapshot → upload → prune → write status."""
+def _validate_snapshot(
+    blob_service: BlobServiceClient, container: str, name: str, expected_count: int
+) -> None:
+    """
+    Validate that the snapshot blob contains the expected number of entities.
+
+    Args:
+        blob_service: An authenticated BlobServiceClient.
+        container: The name of the blob container.
+        name: The name of the snapshot blob to validate.
+        expected_count: The expected number of entities in the snapshot.
+
+    Raises:
+        RuntimeError: If the actual count of entities does not match the expected count.
+    """
+    client = blob_service.get_blob_client(container=container, blob=name)
+    data = json.loads(client.download_blob().readall())
+    actual_count = len(data)
+    if actual_count != expected_count:
+        raise RuntimeError(
+            f"Validation failed for {name}: expected {expected_count} entities, "
+            f"got {actual_count}. Aborting prune and status update."
+        )
+    logging.info("Validation passed: %d entities in %s.", actual_count, name)
+
+
+def run_backup(source_table=None) -> None:
+    """
+    Run a full backup cycle: snapshot → upload → validate → prune → status.
+
+    Args:
+        source_table: Optional table name to back up. If None, uses PROD_TABLE_NAME.
+
+    Returns:
+        None. Raises exceptions on failure.
+    """
     started_at = datetime.now(UTC)
     container = _get_env("BACKUP_CONTAINER_NAME")
     credential = _credential()
 
     logging.info("Connecting to table...")
-    table = _table_client(credential)
+    table = _table_client(credential, table_name=source_table)
     entities = _fetch_entities(table)
     entity_count = len(entities)
     logging.info("Fetched %d entities.", entity_count)
@@ -193,6 +338,7 @@ def run_backup() -> None:
         json.dumps(entities, default=str, indent=2),
     )
 
+    _validate_snapshot(blob_service, container, snapshot_name, entity_count)
     _prune_snapshots(blob_service, container)
 
     status = {
@@ -219,6 +365,12 @@ def _batch_clear_table(table: TableClient) -> int:
     calls than individual deletes) and keep the operation atomic per partition.
     At current scale this is negligible; the pattern is chosen for correctness
     at any scale.
+
+    Args:
+        table: An authenticated TableClient for the target table.
+
+    Returns:
+        The total number of entities deleted.
     """
 
     deleted = 0
@@ -252,7 +404,23 @@ def _batch_clear_table(table: TableClient) -> int:
     return deleted
 
 
-def run_restore(snapshot_path: str) -> None:
+def _get_restore_target() -> str:
+    """
+    Determine the target table for restore based on the environment.
+
+    Args:
+        None
+    Returns:
+        The name of the target table for restore (DEV_TABLE_NAME or PROD_TABLE_NAME).
+    """
+    env = os.environ.get("AZURE_FUNCTIONS_ENVIRONMENT", "Development")
+
+    if env == "Development":
+        return _get_env("DEV_TABLE_NAME")
+    return _get_env("PROD_TABLE_NAME")
+
+
+def run_restore(snapshot_path: str, target_table=None) -> None:
     """
     Restore all entities from a local JSON snapshot file.
 
@@ -262,20 +430,31 @@ def run_restore(snapshot_path: str) -> None:
     The target table is re-created if it does not exist.
     Existing entities with matching keys are overwritten (upsert).
     Prints before/after entity counts for verification.
+
+    Args:
+        snapshot_path: Path to the local snapshot JSON file.
+        target_table: Optional table name to restore into.
+            If None, uses DEV_TABLE_NAME or PROD_TABLE_NAME based on environment.
+
+    Returns:
+        None. Raises exceptions on failure.
     """
     credential = _credential()
     account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
-    table_name = _get_env("MODEL_RUNS_TABLE_NAME")
+    table_name = target_table if target_table is not None else _get_restore_target()
     endpoint = f"https://{account}.table.core.windows.net"
 
     # Ensure table exists
     service = TableServiceClient(endpoint=endpoint, credential=credential)
     service.create_table_if_not_exists(table_name)
 
-    table = _table_client(credential)
+    table = _table_client(credential, table_name=table_name)
 
     before_count = sum(1 for _ in table.list_entities())
     logging.info("Entities before restore: %d", before_count)
+
+    cleared = _batch_clear_table(table)
+    logging.info("Deleted %d existing entities in batches before restore.", cleared)
 
     with open(snapshot_path) as f:
         tagged_entities = json.load(f)
@@ -285,7 +464,7 @@ def run_restore(snapshot_path: str) -> None:
         entity = {}
         for k, v in tagged.items():
             if isinstance(v, dict) and "__type__" in v:
-                entity[k] = _deserialise_value(v["__type__"], v["value"])
+                entity[k] = _deserialize_value(v["__type__"], v["value"])
             else:
                 entity[k] = v  # Legacy format: use as-is
         table.upsert_entity(entity)
@@ -303,9 +482,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--restore", metavar="FILE", help="Restore from a local snapshot JSON file."
     )
+
+    parser.add_argument("--source-table", help="Override table to back up from")
+    parser.add_argument("--target-table", help="Override table to restore into")
     args = parser.parse_args()
 
     if args.restore:
-        run_restore(args.restore)
+        run_restore(args.restore, target_table=args.target_table)
     else:
-        run_backup()
+        run_backup(source_table=args.source_table)
