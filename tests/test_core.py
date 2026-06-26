@@ -255,7 +255,7 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
         "DEV_TABLE_NAME": "devtable",
     },
 )
-def test_run_restore_handles_tagged_entities_with_datetime(mock_cred, mock_tsc):
+def test_run_restore_handles_tagged_entities_with_datetime(mock_cred, mock_table_client, mock_tsc):
     """Verify that EDM-tagged JSON (including DateTime) is deserialized correctly."""
     tagged = [
         {

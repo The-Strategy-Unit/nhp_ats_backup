@@ -250,10 +250,11 @@ def test_main_restore_runs_when_confirmed():
     with (
         patch("sys.argv", ["cli"]),
         patch("backup.cli._get_env", return_value="some_table"),
-        patch("backup.cli._confirm", side_effect=[False, True]),
+        patch("backup.cli._confirm", side_effect=[False, True, True]),
         patch("backup.cli._resolve_snapshot", return_value="snap.json"),
         patch("backup.cli._download_snapshot", return_value="local_snap.json"),
         patch.object(backup.cli, "run_restore") as mock_restore,
+        patch("builtins.open", mock_open(read_data=json.dumps([{"dummy": "entity"}]))),
     ):
         result = main()
 
