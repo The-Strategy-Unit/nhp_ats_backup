@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+import backup.cli
 from backup.cli import (
     _confirm,
     _download_snapshot,
@@ -12,7 +13,6 @@ from backup.cli import (
     _resolve_snapshot,
     main,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,7 +96,11 @@ def test_find_snapshots_returns_sorted():
 
         result = _find_snapshots(MagicMock(), "my-container")
 
-    assert result == ["2026-06-01T00:00Z.json", "2026-06-02T00:00Z.json", "2026-06-03T00:00Z.json"]
+    assert result == [
+        "2026-06-01T00:00Z.json",
+        "2026-06-02T00:00Z.json",
+        "2026-06-03T00:00Z.json",
+    ]
 
 
 def test_find_snapshots_returns_empty_for_no_matches():
@@ -127,9 +131,9 @@ def test_resolve_snapshot_reads_status_json_when_no_date():
         blob_service = mock_blob_client.return_value
         status_client = MagicMock()
         blob_service.get_blob_client.return_value = status_client
-        status_client.download_blob.return_value.readall.return_value = (
-            json.dumps(status_data).encode()
-        )
+        status_client.download_blob.return_value.readall.return_value = json.dumps(
+            status_data
+        ).encode()
 
         result = _resolve_snapshot(None)
 
@@ -145,9 +149,9 @@ def test_resolve_snapshot_raises_when_status_json_missing_field():
         blob_service = mock_blob_client.return_value
         status_client = MagicMock()
         blob_service.get_blob_client.return_value = status_client
-        status_client.download_blob.return_value.readall.return_value = (
-            json.dumps({}).encode()
-        )
+        status_client.download_blob.return_value.readall.return_value = json.dumps(
+            {}
+        ).encode()
 
         with pytest.raises(ValueError, match="status.json has no latest_snapshot"):
             _resolve_snapshot(None)
@@ -249,7 +253,7 @@ def test_main_restore_runs_when_confirmed():
         patch("backup.cli._confirm", side_effect=[False, True]),
         patch("backup.cli._resolve_snapshot", return_value="snap.json"),
         patch("backup.cli._download_snapshot", return_value="local_snap.json"),
-        patch("backup.cli.run_restore") as mock_restore,
+        patch.object(backup.cli, "run_restore") as mock_restore,
     ):
         result = main()
 
