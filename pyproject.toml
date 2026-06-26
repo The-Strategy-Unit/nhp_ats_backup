@@ -2,7 +2,7 @@
 name = "nhp-ats-backup"
 version = "0.1.0"
 description = "Automated backup of NHP Azure Table Storage to blob"
-requires-python = ">=3.13"
+requires-python = "==3.13"
 
 dependencies = [
     "azure-functions==2.1.0",
