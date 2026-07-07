@@ -5,9 +5,9 @@ Usage (manual):
     python -m backup.core
 
 Environment variables required:
-    AZURE_STORAGE_ACCOUNT_NAME  : Storage account name
+    SOURCE_STORAGE_ACCOUNT_NAME : Source storage account name
     PROD_TABLE_NAME       : Table to back up
-    BACKUP_CONTAINER_NAME       : Blob container for backups 
+    BACKUP_CONTAINER_NAME       : Blob container for backups
 
 Backup layout in blob storage:
     YYYY-MM-DDTHH:MMZ.json   - daily snapshot (JSON, EDM-type-tagged)
@@ -43,13 +43,14 @@ import json
 import logging
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 from azure.data.tables import TableClient, TableServiceClient, TransactionOperation
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 STATUS_BLOB = "status.json"
 MAX_DAILY_SNAPSHOTS = 7
@@ -113,7 +114,7 @@ def _table_client(
     Returns:
         A TableClient pointing to https://{account}.table.core.windows.net.
     """
-    account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
+    account = _get_env("SOURCE_STORAGE_ACCOUNT_NAME")
     table = table_name if table_name is not None else _get_env("PROD_TABLE_NAME")
     endpoint = f"https://{account}.table.core.windows.net"
 
@@ -130,7 +131,7 @@ def _blob_client(credential: DefaultAzureCredential) -> BlobServiceClient:
     Returns:
         A BlobServiceClient pointing to https://{account}.blob.core.windows.net.
     """
-    account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
+    account = _get_env("BACKUP_STORAGE_ACCOUNT_NAME")
     endpoint = f"https://{account}.blob.core.windows.net"
 
     return BlobServiceClient(account_url=endpoint, credential=credential)
@@ -215,7 +216,12 @@ def _deserialize_value(edm_type: str, value):
         raise ValueError(f"Unsupported EDM type: {edm_type}")
     if "DateTime" in edm_type:
         return datetime.fromisoformat(value)
+    # bool("false") is True in Python - guard against string "true"/"false"
     if "Boolean" in edm_type:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() == "true"
         return bool(value)
     if "Int" in edm_type:
         return int(value)
@@ -440,7 +446,7 @@ def run_restore(snapshot_path: str, target_table=None) -> None:
         None. Raises exceptions on failure.
     """
     credential = _credential()
-    account = _get_env("AZURE_STORAGE_ACCOUNT_NAME")
+    account = _get_env("SOURCE_STORAGE_ACCOUNT_NAME")
     table_name = target_table if target_table is not None else _get_restore_target()
     endpoint = f"https://{account}.table.core.windows.net"
 
