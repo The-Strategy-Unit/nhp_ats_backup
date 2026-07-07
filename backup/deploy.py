@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 try:
@@ -16,15 +17,59 @@ except ImportError:
     raise
 
 try:
-    ROOT = Path(__file__).resolve().parent
+    ROOT = Path(__file__).resolve().parent.parent
 except NameError:
     ROOT = Path.cwd()
 
 load_dotenv(ROOT / ".env")
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+class _ColorFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        """Return a formatted log string with ANSI color on both level and message.
+
+        Colours: WARNING=amber, ERROR=red, INFO=soft-white, DEBUG=dim-grey.
+        """
+        level = record.levelno
+        colour = {
+            logging.WARNING: "\033[38;5;214m",
+            logging.ERROR: "\033[31m",
+            logging.INFO: "\033[37m",
+            logging.DEBUG: "\033[90m",
+        }.get(level, "")
+        reset = "\033[0m"
+
+        lvl = f"{colour}{record.levelname}{reset}"
+        msg = f"{colour}{record.getMessage()}{reset}"
+
+        fmt = self._fmt
+        if fmt is None:
+            fmt = "%(levelname)s %(message)s"
+
+        return fmt.replace("%(levelname)s", lvl).replace("%(message)s", msg)
+
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s",
+                    handlers=[logging.StreamHandler()])
+# Attach color formatter to the root handler
+_root_handler = logging.root.handlers[0]
+_root_handler.setFormatter(_ColorFormatter("%(levelname)s %(message)s"))
 
 _CMD_CACHE: dict[tuple[str, ...], dict | None] = {}
+
+
+FUNCIGNORE_CONTENT = """\
+.venv
+__pycache__
+.git
+.env
+local.settings.json
+.ruff_cache
+.pytest_cache
+tests/
+*.egg-info
+*.pyc
+.github/
+"""
 
 
 def run(cmd, check=True, capture_output=False, _sensitive_indices=None, **kwargs):
@@ -135,11 +180,10 @@ def blob_container_exists(account, container, auth_mode):
     return bool(data and data.get("name") == container)
 
 
-def _validate_storage_name(name: str) -> None:
+def _validate_storage_name(name: str, label: str) -> None:
     if not re.fullmatch(r"[a-z0-9]{3,24}", name):
         raise SystemExit(
-            f"Invalid AZURE_STORAGE_ACCOUNT_NAME '{name}': "
-            "must be 3-24 lowercase letters or digits."
+            f"Invalid {label} '{name}': must be 3-24 lowercase letters or digits."
         )
 
 
@@ -155,6 +199,40 @@ def _ensure_requirements_txt(root: Path) -> None:
     run(["uv", "pip", "compile", str(pyproject), "-o", str(req)], capture_output=False)
 
 
+def _ensure_funcignore(root: Path) -> None:
+    path = root / ".funcignore"
+    if path.exists():
+        logging.info(".funcignore already exists")
+        return
+    logging.info("Creating .funcignore")
+    path.write_text(FUNCIGNORE_CONTENT)
+
+
+def _get_function_app_principal_id(app, rg):
+    data = _show_json(
+        ["az", "functionapp", "identity", "show", "--name", app, "--resource-group", rg]
+    )
+    return data.get("principalId") if data else None
+
+
+def _role_assignment_exists(assignee, role, scope):
+    data = _show_json(
+        [
+            "az",
+            "role",
+            "assignment",
+            "list",
+            "--assignee",
+            assignee,
+            "--role",
+            role,
+            "--scope",
+            scope,
+        ]
+    )
+    return bool(data)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deploy NHP ATS Backup to Azure")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation prompts")
@@ -162,52 +240,65 @@ def main():
 
     env = require_env(
         [
-            "AZURE_RESOURCE_GROUP_NAME",
-            "AZURE_LOCATION",
-            "AZURE_STORAGE_ACCOUNT_NAME",
+            "FUNCTION_APP_RESOURCE_GROUP_NAME",
+            "FUNCTION_APP_STORAGE_ACCOUNT_NAME",
+            "BACKUP_RESOURCE_GROUP_NAME",
+            "BACKUP_STORAGE_ACCOUNT_NAME",
             "BACKUP_CONTAINER_NAME",
+            "SOURCE_RESOURCE_GROUP_NAME",
+            "SOURCE_STORAGE_ACCOUNT_NAME",
+            "AZURE_LOCATION",
             "AZURE_FUNCTION_APP_NAME",
             "PROD_TABLE_NAME",
             "DEV_TABLE_NAME",
         ]
     )
 
-    rg = env["AZURE_RESOURCE_GROUP_NAME"]
+    app_rg = env["FUNCTION_APP_RESOURCE_GROUP_NAME"]
+    app_storage = env["FUNCTION_APP_STORAGE_ACCOUNT_NAME"]
+    backup_rg = env["BACKUP_RESOURCE_GROUP_NAME"]
+    backup_storage = env["BACKUP_STORAGE_ACCOUNT_NAME"]
+    source_rg = env["SOURCE_RESOURCE_GROUP_NAME"]
+    source_storage = env["SOURCE_STORAGE_ACCOUNT_NAME"]
+
     location = env["AZURE_LOCATION"]
-    storage = env["AZURE_STORAGE_ACCOUNT_NAME"]
-    _validate_storage_name(storage)
+    app = env["AZURE_FUNCTION_APP_NAME"]
+    container = env["BACKUP_CONTAINER_NAME"]
 
     sku = os.environ.get("AZURE_SKU", "Standard_LRS")
     kind = os.environ.get("AZURE_STORAGE_KIND", "StorageV2")
-    container = env["BACKUP_CONTAINER_NAME"]
-    app = env["AZURE_FUNCTION_APP_NAME"]
     py_version = os.environ.get("AZURE_PYTHON_VERSION", "3.13")
     memory = os.environ.get("AZURE_FUNCTION_INSTANCE_MEMORY", "2048")
     auth_mode = os.environ.get("AZURE_STORAGE_AUTH_MODE", "login")
 
-    # Resource group
-    if resource_group_exists(rg):
-        logging.warning("Resource group '%s' already exists.", rg)
+    _validate_storage_name(app_storage, "FUNCTION_APP_STORAGE_ACCOUNT_NAME")
+    _validate_storage_name(backup_storage, "BACKUP_STORAGE_ACCOUNT_NAME")
+    _validate_storage_name(source_storage, "SOURCE_STORAGE_ACCOUNT_NAME")
+
+    # Function app resource group
+    if resource_group_exists(app_rg):
+        logging.warning("Resource group '%s' already exists.", app_rg)
     else:
-        if ask(f"Create resource group '{rg}' in '{location}'?", args.yes):
-            run(["az", "group", "create", "--name", rg, "--location", location])
+        if ask(f"Create resource group '{app_rg}' in '{location}'?", args.yes):
+            run(["az", "group", "create", "--name", app_rg, "--location", location])
             clear_cache("az", "group", "show")
         else:
             raise SystemExit("Aborted.")
 
-    # Storage account
-    storage_ok, storage_data = storage_account_in_rg(storage, rg, location)
+    # Function app storage account
+    storage_ok, storage_data = storage_account_in_rg(app_storage, app_rg, location)
     if storage_ok:
         logging.warning(
-            "Storage account '%s' already exists in %s/%s.", storage, rg, location
+            "Storage account '%s' already exists in %s/%s.", app_storage, app_rg, location
         )
     elif storage_data:
         raise SystemExit(
-            f"Storage account '{storage}' exists but not in resource group '{rg}' "
+            f"Storage account '{app_storage}' exists "
+            f"but not in resource group '{app_rg}' "
             f"or location '{location}'. Aborting."
         )
     else:
-        if ask(f"Create storage account '{storage}'?", args.yes):
+        if ask(f"Create Function App storage account '{app_storage}'?", args.yes):
             run(
                 [
                     "az",
@@ -215,9 +306,59 @@ def main():
                     "account",
                     "create",
                     "--name",
-                    storage,
+                    app_storage,
                     "--resource-group",
-                    rg,
+                    app_rg,
+                    "--location",
+                    location,
+                    "--sku",
+                    sku,
+                    "--kind",
+                    kind,
+                ],
+                capture_output=False,
+            )
+            clear_cache("az", "storage", "account", "show")
+        else:
+            raise SystemExit("Aborted.")
+
+    # Backup resource group
+    if resource_group_exists(backup_rg):
+        logging.warning("Resource group '%s' already exists.", backup_rg)
+    else:
+        if ask(f"Create resource group '{backup_rg}' in '{location}'?", args.yes):
+            run(["az", "group", "create", "--name", backup_rg, "--location", location])
+            clear_cache("az", "group", "show")
+        else:
+            raise SystemExit("Aborted.")
+
+    # Backup storage account
+    backup_ok, backup_data = storage_account_in_rg(backup_storage, backup_rg, location)
+    if backup_ok:
+        logging.warning(
+            "Storage account '%s' already exists in %s/%s.",
+            backup_storage,
+            backup_rg,
+            location,
+        )
+    elif backup_data:
+        raise SystemExit(
+            f"Storage account '{backup_storage}' exists "
+            f"but not in resource group '{backup_rg}' "
+            f"or location '{location}'. Aborting."
+        )
+    else:
+        if ask(f"Create backup storage account '{backup_storage}'?", args.yes):
+            run(
+                [
+                    "az",
+                    "storage",
+                    "account",
+                    "create",
+                    "--name",
+                    backup_storage,
+                    "--resource-group",
+                    backup_rg,
                     "--location",
                     location,
                     "--sku",
@@ -232,7 +373,7 @@ def main():
             raise SystemExit("Aborted.")
 
     # Backup container
-    if blob_container_exists(storage, container, auth_mode):
+    if blob_container_exists(backup_storage, container, auth_mode):
         logging.warning("Blob container '%s' already exists.", container)
     else:
         if ask(f"Create blob container '{container}'?", args.yes):
@@ -245,7 +386,7 @@ def main():
                     "--name",
                     container,
                     "--account-name",
-                    storage,
+                    backup_storage,
                     "--auth-mode",
                     auth_mode,
                 ],
@@ -256,12 +397,14 @@ def main():
             raise SystemExit("Aborted.")
 
     # Function App
-    app_ok, app_data = function_app_in_rg(app, rg, location)
+    app_ok, app_data = function_app_in_rg(app, app_rg, location)
     if app_ok:
-        logging.warning("Function App '%s' already exists in %s/%s.", app, rg, location)
+        logging.warning(
+            "Function App '%s' already exists in %s/%s.", app, app_rg, location
+        )
     elif app_data:
         raise SystemExit(
-            f"Function App '{app}' exists but not in resource group '{rg}' "
+            f"Function App '{app}' exists but not in resource group '{app_rg}' "
             f"or location '{location}'. Aborting."
         )
     else:
@@ -272,11 +415,11 @@ def main():
                     "functionapp",
                     "create",
                     "--resource-group",
-                    rg,
+                    app_rg,
                     "--name",
                     app,
                     "--storage-account",
-                    storage,
+                    app_storage,
                     "--flexconsumption-location",
                     location,
                     "--runtime",
@@ -297,10 +440,12 @@ def main():
     # App settings
     if ask(f"Configure app settings on '{app}'?", args.yes):
         settings = [
-            f"AZURE_STORAGE_ACCOUNT_NAME={storage}",
+            f"SOURCE_STORAGE_ACCOUNT_NAME={source_storage}",
+            f"SOURCE_RESOURCE_GROUP_NAME={source_rg}",
             f"PROD_TABLE_NAME={env['PROD_TABLE_NAME']}",
-            f"BACKUP_CONTAINER_NAME={container}",
             f"DEV_TABLE_NAME={env['DEV_TABLE_NAME']}",
+            f"BACKUP_STORAGE_ACCOUNT_NAME={backup_storage}",
+            f"BACKUP_CONTAINER_NAME={container}",
         ]
         cmd = [
             "az",
@@ -311,16 +456,97 @@ def main():
             "--name",
             app,
             "--resource-group",
-            rg,
+            app_rg,
             "--settings",
             *settings,
         ]
         sensitive_indices = set(range(len(cmd) - len(settings), len(cmd)))
         run(cmd, capture_output=False, _sensitive_indices=sensitive_indices)
         clear_cache("az", "functionapp", "show")
+    else:
+        raise SystemExit(
+            "Aborted: app settings are required for the Function App to run."
+        )
+
+    # Role assignments for cross-resource-group access
+    principal_id = _get_function_app_principal_id(app, app_rg)
+    if not principal_id:
+        logging.warning(
+            """Could not determine Function App managed identity.  
+            Skipping role assignments."""
+        )
+    else:
+        account_data = _show_json(["az", "account", "show"])
+        subscription_id = account_data.get("id", "") if account_data else ""
+
+        source_scope = (
+            f"/subscriptions/{subscription_id}/resourceGroups/{source_rg}"
+            f"/providers/Microsoft.Storage/storageAccounts/{source_storage}"
+        )
+        backup_scope = (
+            f"/subscriptions/{subscription_id}/resourceGroups/{backup_rg}"
+            f"/providers/Microsoft.Storage/storageAccounts/{backup_storage}"
+        )
+
+        if ask(
+            f"Grant Function App access to source table '{source_storage}'?", args.yes
+        ):
+            if not _role_assignment_exists(
+                principal_id, "Storage Table Data Contributor", source_scope
+            ):
+                run(
+                    [
+                        "az",
+                        "role",
+                        "assignment",
+                        "create",
+                        "--assignee-object-id",
+                        principal_id,
+                        "--assignee-principal-type",
+                        "ServicePrincipal",
+                        "--role",
+                        "Storage Table Data Contributor",
+                        "--scope",
+                        source_scope,
+                    ],
+                    capture_output=False,
+                )
+                logging.info("Role assignment created. Waiting for propagation...")
+                time.sleep(30)
+            else:
+                logging.warning("Role assignment already exists for source table.")
+
+        if ask(
+            f"Grant Function App access to backup storage '{backup_storage}'?", args.yes
+        ):
+            if not _role_assignment_exists(
+                principal_id, "Storage Blob Data Contributor", backup_scope
+            ):
+                run(
+                    [
+                        "az",
+                        "role",
+                        "assignment",
+                        "create",
+                        "--assignee-object-id",
+                        principal_id,
+                        "--assignee-principal-type",
+                        "ServicePrincipal",
+                        "--role",
+                        "Storage Blob Data Contributor",
+                        "--scope",
+                        backup_scope,
+                    ],
+                    capture_output=False,
+                )
+                logging.info("Role assignment created. Waiting for propagation...")
+                time.sleep(30)
+            else:
+                logging.warning("Role assignment already exists for backup storage.")
 
     # Publish
     _ensure_requirements_txt(ROOT)
+    _ensure_funcignore(ROOT)
     if ask(f"Publish functions to '{app}'?", args.yes):
         run(["func", "azure", "functionapp", "publish", app], capture_output=False)
 
