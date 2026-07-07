@@ -145,7 +145,8 @@ def test_prune_excludes_status_blob():
 @patch.dict(
     "os.environ",
     {
-        "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
+        "SOURCE_STORAGE_ACCOUNT_NAME": "myaccount",
+        "BACKUP_STORAGE_ACCOUNT_NAME": "backupaccount",
         "PROD_TABLE_NAME": "mytable",
         "BACKUP_CONTAINER_NAME": "mycontainer",
         "MODEL_RUNS_TABLE_NAME": "mytable",
@@ -198,7 +199,7 @@ def test_run_backup_uploads_snapshot_and_status(
 @patch.dict(
     "os.environ",
     {
-        "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
+        "SOURCE_STORAGE_ACCOUNT_NAME": "myaccount",
         "PROD_TABLE_NAME": "mytable",
         "DEV_TABLE_NAME": "devtable",
     },
@@ -218,7 +219,9 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
     table.upsert_entity.assert_any_call({"PartitionKey": "a", "RowKey": "1"})
     table.upsert_entity.assert_any_call({"PartitionKey": "b", "RowKey": "2"})
     assert table.submit_transaction.call_count == 2
-    assert len(table.submit_transaction.call_args[0][0]) == 1  # one delete per PartitionKey batch
+    assert (
+        len(table.submit_transaction.call_args[0][0]) == 1
+    )  # one delete per PartitionKey batch
 
 
 @patch("backup.core.TableServiceClient")
@@ -228,7 +231,7 @@ def test_run_restore_upserts_all_entities(mock_cred, mock_table_client, mock_tsc
     "os.environ",
     {
         "AZURE_FUNCTIONS_ENVIRONMENT": "Production",
-        "AZURE_STORAGE_ACCOUNT_NAME": "myaccount",
+        "SOURCE_STORAGE_ACCOUNT_NAME": "myaccount",
         "PROD_TABLE_NAME": "mytable",
         "MODEL_RUNS_TABLE_NAME": "mytable",
     },
@@ -255,7 +258,9 @@ def test_run_restore_creates_table_if_missing(mock_cred, mock_table_client, mock
         "DEV_TABLE_NAME": "devtable",
     },
 )
-def test_run_restore_handles_tagged_entities_with_datetime(mock_cred, mock_table_client, mock_tsc):
+def test_run_restore_handles_tagged_entities_with_datetime(
+    mock_cred, mock_table_client, mock_tsc
+):
     """Verify that EDM-tagged JSON (including DateTime) is deserialized correctly."""
     tagged = [
         {
