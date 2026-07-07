@@ -153,7 +153,8 @@ def main() -> int:
                 return 1
 
             print(
-                f"Snapshot: {snapshot_name} | entities: {entity_count} | target: {target_table}"
+                f"Snapshot: {snapshot_name} | entities: "
+                f"{entity_count} | target: {target_table}"
             )
             if not _confirm(f"Proceed with restore to {target_table}? [y/N]"):
                 print("Restore aborted.")
