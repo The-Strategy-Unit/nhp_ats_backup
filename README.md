@@ -1,63 +1,155 @@
 # NHP ATS Backup
 
-Back up and restore NHP Azure Table Storage (ATS) via JSON snapshots in Blob Storage.
+Backup and restore NHP Azure Table Storage (ATS) table via JSON snapshots in Blob Storage.
 
-## Prerequisites
+## Quick ops
 
-- [uv](https://docs.astral.sh/uv/)
-- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli)
-- [Azure Functions Core Tools](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local) (optional, for local testing)
+```bash
+# Log in (required for both login and managed identity flows)
+az login
+
+# Backup PROD table
+uv run --env-file .env python -m backup.core
+
+# Restore (interactive - prompts before each step)
+uv run --env-file .env python -m backup.cli
+
+# Restore from a specific snapshot
+uv run --env-file .env python -m backup.cli --restore-date 2026-06-17
+
+# Back up from a specific table
+uv run --env-file .env python -m backup.cli --source-table <source_table_name>
+
+# Restore to a specific table
+uv run --env-file .env python -m backup.cli --target-table <target_table_name> # table must exist
+```
+
+**Note on restore flows:**
+- `backup.cli` is the convenient path: it downloads the snapshot from Blob Storage and restores it in one command.
+- `backup.core --restore <file>` is the low-level path for restoring a snapshot you already have on disk (e.g. downloaded with `az storage blob download`).
+
+## Contents
+
+- [Backup](#backup)
+- [Restore](#restore)
+- [Configuration](#configuration)
+- [Deploy a new Function App](#deploy-a-new-function-app)
+- [Local development](#local-development)
+- [Developer notes](#developer-notes)
+
+---
+
+## Backup
+
+The Function App runs automatically at **02:00 UTC daily**. A snapshot is a full JSON copy with EDM type tags (DateTime, Int64 - ensures round-trip fidelity).
+
+### Trigger manually (cloud)
+
+```bash
+curl -X POST https://<AZURE_FUNCTION_APP_NAME>.azurewebsites.net/api/nhp-ats-backup-dev \
+  -H "Content-Type: application/json"
+```
+
+### Run locally
+
+```bash
+# PROD table (default)
+uv run --env-file .env python -m backup.core
+
+# Different table
+uv run --env-file .env python -m backup.core --source-table other-table
+```
+
+**What happens:** fetch entities → tag EDM types → upload `YYYY-MM-DDTHH:MMZ.json` → validate count → prune old snapshots (7 daily, 6 monthly) → write `status.json`.
+
+---
+
+## Restore
+
+### Interactive (recommended)
+
+Prompts you first, picks the latest snapshot from `status.json`:
+
+```bash
+uv run --env-file .env python -m backup.cli
+```
+
+### From a specific snapshot
+
+```bash
+# Download from Blob Storage
+SNAPSHOT=$(az storage blob list \
+  --account-name "$BACKUP_STORAGE_ACCOUNT_NAME" \
+  --container-name "$BACKUP_CONTAINER_NAME" \
+  --query "[].name" -o tsv | grep -E '^\d{4}-' | sort | tail -1)
+
+az storage blob download \
+  --account-name "$BACKUP_STORAGE_ACCOUNT_NAME" \
+  --container-name "$BACKUP_CONTAINER_NAME" \
+  --name "$SNAPSHOT" --file snapshot.json
+
+# Restore into a table
+uv run --env-file .env python -m backup.core \
+  --restore snapshot.json --target-table <table_name>
+```
+
+**Note:** Before restoring, all existing entities are deleted and the snapshot is upserted. The result is identical to the snapshot - no partial merges.
+
+---
 
 ## Configuration
 
-Create a `.env` file in the repo root by copying and filling in the values below:
+Create `.env` in the repo root:
 
 ```bash
-# Azure resources
-AZURE_STORAGE_ACCOUNT_NAME=<storage-name>      # Globally unique, lowercase letters+numbers, 3-24 chars
-AZURE_RESOURCE_GROUP_NAME=<resource-group>     # Existing resource group where resources are created
-AZURE_LOCATION=<region>                        # e.g. australiaeast; pick one near your users
+# Source (your ATS)
+SOURCE_RESOURCE_GROUP_NAME=<rg>
+SOURCE_STORAGE_ACCOUNT_NAME=<storage-name>     # 3-24 lowercase chars
 
-# Storage configuration
-AZURE_SKU=Standard_LRS                         # Cheapest; fine for dev/test and small prod workloads
-AZURE_STORAGE_KIND=StorageV2                   # General-purpose v2; supports blobs, queues, tables
-
-# Backup targets
-PROD_TABLE_NAME=<ats-name>                     # Production Azure Table Storage table to back up
-BACKUP_CONTAINER_NAME=<backup-container-name>  # Blob container for JSON snapshots
-DEV_TABLE_NAME=<ats-dev-name>                  # Dev/test table for safe restore experiments
+# Backup destination
+BACKUP_RESOURCE_GROUP_NAME=<rg>
+BACKUP_STORAGE_ACCOUNT_NAME=<storage-name>     # 3-24 lowercase chars
+BACKUP_CONTAINER_NAME=<container-name>
 
 # Function App
-AZURE_FUNCTION_APP_NAME=<function-app-name>    # Globally unique, used in URLs and deployment
-AZURE_PYTHON_VERSION=3.13                      # Max version supported by Azure Functions; 3.14 is still in preview
-AZURE_FUNCTION_INSTANCE_MEMORY=2048            # Flex Consumption memory in MB; 2048 is a good default
+FUNCTION_APP_RESOURCE_GROUP_NAME=<rg>
+FUNCTION_APP_STORAGE_ACCOUNT_NAME=<storage-name> # 3-24 lowercase chars
+AZURE_FUNCTION_APP_NAME=<app-name>             # globally unique
+AZURE_LOCATION=<region>                          # e.g. ukwest
+
+# Tables
+PROD_TABLE_NAME=<prod-table>
+DEV_TABLE_NAME=<dev-table>
+
+# Optional (defaults shown)
+# AZURE_STORAGE_AUTH_MODE=login
+# AZURE_SKU=Standard_LRS
+# AZURE_STORAGE_KIND=StorageV2
+# AZURE_PYTHON_VERSION=3.13
+# AZURE_FUNCTION_INSTANCE_MEMORY=2048
 ```
 
-Windows users should omit `export` or use `set` instead.
-Notice that `AZURE_SKU` and `AZURE_STORAGE_KIND` default to `Standard_LRS` and `StorageV2` if omitted.
+---
 
-## Quick deploy
+## Deploy a new Function App
 
+### One command (recommended)
 
-### Automated deploy
+```bash
+uv run deploy.py --yes
+```
 
-Run `uv run deploy.py` to interactively create the resource group, storage account,
-Function App, backup container, app settings, and publish the functions.
-Add `--yes` to skip confirmation prompts.
+Creates resource groups, storage accounts, Function App, app settings, role assignments, and publishes.
 
-This project uses **Azure Functions on Flex Consumption** (Python 3.13).
+### Manual (step by step)
 
-### 1. Generate `requirements.txt`
-
-Azure's remote build uses pip, not uv. Compile a lockfile before every deploy:
+#### 1. Requirements
 
 ```bash
 uv pip compile pyproject.toml -o requirements.txt
 ```
 
-### 2. Prepare `.funcignore`
-
-Ensure `.funcignore` exists so the publish step skips your local venv and build artefacts:
+Create `.funcignore`:
 
 ```text
 .venv
@@ -73,126 +165,102 @@ tests/
 .github/
 ```
 
-### 3. Azure resources and app settings
-
-<details>
-<summary><b>Click to expand: create storage account, Function App, and configure app settings</b></summary>
-
-Create the storage account. The name must be globally unique, lowercase letters and numbers only, 3–24 characters.
+#### 2. Function App resources
 
 ```bash
+az group create --name "$FUNCTION_APP_RESOURCE_GROUP_NAME" --location "$AZURE_LOCATION"
+
 az storage account create \
-  --name "$AZURE_STORAGE_ACCOUNT_NAME" \
-  --resource-group "$AZURE_RESOURCE_GROUP_NAME" \
+  --name "$FUNCTION_APP_STORAGE_ACCOUNT_NAME" \
+  --resource-group "$FUNCTION_APP_RESOURCE_GROUP_NAME" \
   --location "$AZURE_LOCATION" \
-  --sku "$AZURE_SKU" \
-  --kind "$AZURE_STORAGE_KIND"
-```
+  --sku "$AZURE_SKU" --kind "$AZURE_STORAGE_KIND"
 
-Create the backup container:
-
-```bash
-az storage container create \
-  --name "$BACKUP_CONTAINER_NAME" \
-  --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
-  --auth-mode login
-```
-
-Create the Function App:
-
-```bash
 az functionapp create \
-  --resource-group "$AZURE_RESOURCE_GROUP_NAME" \
+  --resource-group "$FUNCTION_APP_RESOURCE_GROUP_NAME" \
   --name "$AZURE_FUNCTION_APP_NAME" \
-  --storage-account "$AZURE_STORAGE_ACCOUNT_NAME" \
+  --storage-account "$FUNCTION_APP_STORAGE_ACCOUNT_NAME" \
   --flexconsumption-location "$AZURE_LOCATION" \
-  --runtime python \
-  --runtime-version "$AZURE_PYTHON_VERSION" \
+  --runtime python --runtime-version "$AZURE_PYTHON_VERSION" \
   --functions-version 4 \
   --instance-memory "$AZURE_FUNCTION_INSTANCE_MEMORY"
 ```
 
-Configure app settings:
+#### 3. Backup resources
+
+```bash
+az group create --name "$BACKUP_RESOURCE_GROUP_NAME" --location "$AZURE_LOCATION"
+
+az storage account create \
+  --name "$BACKUP_STORAGE_ACCOUNT_NAME" \
+  --resource-group "$BACKUP_RESOURCE_GROUP_NAME" \
+  --location "$AZURE_LOCATION" \
+  --sku "$AZURE_SKU" --kind "$AZURE_STORAGE_KIND"
+
+az storage container create \
+  --name "$BACKUP_CONTAINER_NAME" \
+  --account-name "$BACKUP_STORAGE_ACCOUNT_NAME" --auth-mode login
+```
+
+#### 4. App settings
 
 ```bash
 az functionapp config appsettings set \
   --name "$AZURE_FUNCTION_APP_NAME" \
-  --resource-group "$AZURE_RESOURCE_GROUP_NAME" \
+  --resource-group "$FUNCTION_APP_RESOURCE_GROUP_NAME" \
   --settings \
-    "AZURE_STORAGE_ACCOUNT_NAME=$AZURE_STORAGE_ACCOUNT_NAME" \
+    "SOURCE_STORAGE_ACCOUNT_NAME=$SOURCE_STORAGE_ACCOUNT_NAME" \
+    "SOURCE_RESOURCE_GROUP_NAME=$SOURCE_RESOURCE_GROUP_NAME" \
     "PROD_TABLE_NAME=$PROD_TABLE_NAME" \
-    "BACKUP_CONTAINER_NAME=$BACKUP_CONTAINER_NAME" \
-    "DEV_TABLE_NAME=$DEV_TABLE_NAME"
+    "DEV_TABLE_NAME=$DEV_TABLE_NAME" \
+    "BACKUP_STORAGE_ACCOUNT_NAME=$BACKUP_STORAGE_ACCOUNT_NAME" \
+    "BACKUP_CONTAINER_NAME=$BACKUP_CONTAINER_NAME"
 ```
 
-</details>
+#### 5. Permissions (cross-RG access)
 
-### 4. Publish
+```bash
+PRINCIPAL_ID=$(az functionapp identity show \
+  --name "$AZURE_FUNCTION_APP_NAME" \
+  --resource-group "$FUNCTION_APP_RESOURCE_GROUP_NAME" \
+  --query principalId -o tsv)
+
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Table Data Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$SOURCE_RESOURCE_GROUP_NAME/providers/Microsoft.Storage/storageAccounts/$SOURCE_STORAGE_ACCOUNT_NAME"
+
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$BACKUP_RESOURCE_GROUP_NAME/providers/Microsoft.Storage/storageAccounts/$BACKUP_STORAGE_ACCOUNT_NAME"
+```
+
+#### 6. Publish
 
 ```bash
 func azure functionapp publish "$AZURE_FUNCTION_APP_NAME"
 ```
 
-The app contains two functions:
+The app exposes:
 
 | Function | Trigger | Route / Schedule |
-|----------|---------|------------------|
-| `nhp_ats_backup` | Timer | `0 0 2 * * *` (02:00 UTC daily) |
+|-----|-----|----|
+| `nhp_ats_backup` | Timer | `0 0 2 * * *` |
 | `nhp_ats_backup_dev` | HTTP | `POST /api/nhp-ats-backup-dev` |
 
-## Usage
+---
 
-### Create a backup (local)
+## Local development
 
-```bash
-uv run --env-file .env python -m backup.core
-```
-
-### Restore (interactive)
-
-```bash
-uv run --env-file .env python -m backup.cli
-```
-
-### Restore a specific date
-
-```bash
-uv run --env-file .env python -m backup.cli --restore-date 2026-06-17
-```
-
-### Restore to a specific table
-
-```bash
-uv run --env-file .env python -m backup.core --restore snapshot.json --target-table <table_name>
-```
-
-### Non-interactive restore
-
-```bash
-# Identify latest snapshot
-SNAPSHOT=$(az storage blob list --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
-  --container-name "$BACKUP_CONTAINER_NAME" --query "[].name" -o tsv \
-  | grep -E '^\d{4}-' | sort | tail -1)
-
-# Download
-az storage blob download --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
-  --container-name "$BACKUP_CONTAINER_NAME" --name "$SNAPSHOT" \
-  --file snapshot.json
-
-# Restore
-uv run --env-file .env python -m backup.core --restore snapshot.json --target-table <table_name>
-```
-
-## Local testing
-
-<details>
-<summary><b>Click to expand</b></summary>
-
-Create `local.settings.json`:
+### Generate `local.settings.json`
 
 ```python
 import json
-import re
 
 env = {}
 with open(".env") as f:
@@ -208,7 +276,8 @@ settings = {
         "AzureWebJobsStorage": "UseDevelopmentStorage=true",
         "FUNCTIONS_WORKER_RUNTIME": "python",
         "AZURE_FUNCTIONS_ENVIRONMENT": "Development",
-        "AZURE_STORAGE_ACCOUNT_NAME": env["AZURE_STORAGE_ACCOUNT_NAME"],
+        "SOURCE_STORAGE_ACCOUNT_NAME": env["SOURCE_STORAGE_ACCOUNT_NAME"],
+        "BACKUP_STORAGE_ACCOUNT_NAME": env["BACKUP_STORAGE_ACCOUNT_NAME"],
         "PROD_TABLE_NAME": env["PROD_TABLE_NAME"],
         "BACKUP_CONTAINER_NAME": env["BACKUP_CONTAINER_NAME"],
         "DEV_TABLE_NAME": env["DEV_TABLE_NAME"],
@@ -220,48 +289,41 @@ with open("local.settings.json", "w") as f:
     f.write("\n")
 ```
 
-Save the above Python code in `local_settings.py` and run it: `uv run local_settings.py`
+Run it: `uv run local_settings_helper.py`
 
-Run the host:
+### Run locally
+
+Start Azurite first (the Functions runtime needs local blob/queue/table emulation):
+
+```bash
+azurite
+```
+
+Then:
 
 ```bash
 func start
-```
-
-Invoke the timer function manually:
-
-```bash
 curl http://localhost:7071/admin/functions/nhp_ats_backup -X POST -d '{}'
 ```
 
-</details>
+---
 
 ## Developer notes
 
-<details>
-<summary><b>Click to expand</b></summary>
+### Files
 
-- `backup/core.py` — library functions and non-interactive backup/restore
-- `backup/cli.py` — interactive workflow and snapshot resolution
-- `function_app.py` — Azure Function entrypoint (timer + HTTP)
+| File | Purpose |
+|-----|-----|
+| `backup/core.py` | Core backup/restore (non-interactive) |
+| `backup/cli.py` | Interactive CLI |
+| `backup/deploy.py` | One-command deployment |
+| `function_app.py` | Azure Functions entrypoint |
 
-### Snapshots
-- JSON format with EDM type tags for perfect round-trip fidelity
-- Stored as `YYYY-MM-DDTHH:MMZ.json`
-- Retention: 7 daily snapshots + 6 monthly keepers (see `_prune_snapshots` in `core.py`)
+Snapshots are full copies (7 daily + 6 monthly keepers) - cheaper and simpler than deltas at ~180 KB/snapshot.
 
-### Tests
 ```bash
 uv run pytest
-```
-
-### Lint / Format
-```bash
 uv run ruff check .
 uv run ruff format .
 ```
 
-### Status reporting
-The backup script emits structured logs (success/failure, entity count, latest snapshot) for consumption by `nhp_ats_tui`.
-
-</details>
